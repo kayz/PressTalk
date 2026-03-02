@@ -16,6 +16,8 @@ dist/
 *.log
 *.tmp
 *.cache
+*.pyc
+__pycache__/
 .tmp-*/
 
 # OS files
