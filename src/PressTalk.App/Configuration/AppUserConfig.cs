@@ -7,5 +7,16 @@ public sealed class AppUserConfig
     public string HoldKeyName { get; set; } = "F8";
 
     public uint HoldKeyVirtualKey { get; set; } = 0x77;
-}
 
+    public bool EnableLiveCaption { get; set; }
+
+    public bool EnableManualSemanticLlm { get; set; }
+
+    public bool EnableStickyDictationSemantic { get; set; } = true;
+
+    public bool AlwaysOnTop { get; set; } = true;
+
+    public int? FloatingWindowX { get; set; }
+
+    public int? FloatingWindowY { get; set; }
+}

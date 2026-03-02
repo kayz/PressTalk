@@ -1,6 +1,11 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.Text;
 using System.Threading.Channels;
+using System.Windows.Forms;
 using PressTalk.App.Configuration;
 using PressTalk.App.Hotkey;
+using PressTalk.App.Ui;
 using PressTalk.Asr;
 using PressTalk.Audio;
 using PressTalk.Commit;
@@ -8,10 +13,38 @@ using PressTalk.Contracts.Asr;
 using PressTalk.Contracts.Commit;
 using PressTalk.Engine;
 using PressTalk.Normalize;
-using System.Text;
 
-var app = new PressTalkConsoleApp(args);
-await app.RunAsync(CancellationToken.None);
+namespace PressTalk.App;
+
+internal static class Program
+{
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Console.OutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        Console.InputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
+        using var host = new PressTalkUiHost(args);
+
+        try
+        {
+            host.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
+            Application.Run(host.Form);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"PressTalk startup failed:\n\n{ex.Message}",
+                "PressTalk",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return 1;
+        }
+    }
+}
 
 internal enum AppLogLevel
 {
@@ -24,10 +57,17 @@ internal enum AppLogLevel
 internal sealed class AppLogger
 {
     private readonly AppLogLevel _minimumLevel;
+    private readonly object _sync = new();
+    private readonly string _logPath;
 
     public AppLogger(AppLogLevel minimumLevel)
     {
         _minimumLevel = minimumLevel;
+        _logPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PressTalk",
+            "logs",
+            $"{DateTime.Now:yyyyMMdd}.log");
     }
 
     public void Debug(string message) => Log(AppLogLevel.Debug, message);
@@ -47,279 +87,306 @@ internal sealed class AppLogger
             return;
         }
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [{level.ToString().ToUpperInvariant()}] {message}");
+        var line = $"[{DateTime.Now:HH:mm:ss.fff}] [{level.ToString().ToUpperInvariant()}] {message}";
+        System.Diagnostics.Debug.WriteLine(line);
+
+        lock (_sync)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
+                File.AppendAllText(_logPath, line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch
+            {
+                // Logging must not break app runtime.
+            }
+        }
     }
 }
 
-internal sealed class PressTalkConsoleApp
+internal sealed class PressTalkUiHost : IDisposable
 {
     private const int StickySemanticMinChars = 80;
 
     private readonly string[] _args;
     private readonly UserConfigStore _configStore = new();
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly Channel<HoldSignal> _signalChannel = Channel.CreateUnbounded<HoldSignal>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
 
-    public PressTalkConsoleApp(string[] args)
+    private AppLogger? _logger;
+    private Action<string>? _log;
+
+    private AppUserConfig? _config;
+    private GlobalHoldKeyHook? _hotkeyHook;
+    private QwenRuntimeClient? _runtime;
+    private WasapiAudioCaptureService? _audioCapture;
+    private HoldToTalkController? _controller;
+    private ForegroundWindowTracker? _windowTracker;
+    private Task? _workerTask;
+
+    private bool _isRecording;
+    private bool _isStickyRecording;
+    private bool _isHotkeyPressed;
+
+    private bool _enableLiveCaption;
+    private bool _enableManualSemanticLlm;
+    private bool _enableStickyDictationSemantic;
+
+    public PressTalkUiHost(string[] args)
     {
         _args = args;
+        Form = new FloatingRecorderForm();
+        Form.FormClosing += (_, _) =>
+        {
+            SaveWindowPosition();
+            ShutdownAsync().GetAwaiter().GetResult();
+        };
+        Form.SettingsRequested += (_, _) => OpenSettingsDialog();
     }
 
-    public async Task RunAsync(CancellationToken cancellationToken)
-    {
-        Console.OutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-        Console.InputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    public FloatingRecorderForm Form { get; }
 
+    public async Task InitializeAsync(CancellationToken cancellationToken)
+    {
         var minimumLogLevel = ResolveLogLevel(_args);
-        var logger = new AppLogger(minimumLogLevel);
-        Action<string> log = logger.AsDelegate(AppLogLevel.Debug);
-        logger.Info($"[App] log level={minimumLogLevel}");
-        log($"[App] process started, pid={Environment.ProcessId}, cwd='{Environment.CurrentDirectory}'");
+        _logger = new AppLogger(minimumLogLevel);
+        _log = _logger.AsDelegate(AppLogLevel.Debug);
+
+        _logger.Info($"[App] log level={minimumLogLevel}");
+        _log($"[App] process started, pid={Environment.ProcessId}, cwd='{Environment.CurrentDirectory}'");
 
         if (_args.Any(a => string.Equals(a, "--reset-hotkey", StringComparison.OrdinalIgnoreCase)))
         {
             _configStore.Delete();
-            logger.Info("[App] Hotkey config was reset.");
+            _logger.Info("[App] Hotkey config was reset.");
         }
 
-        var config = await EnsureConfigAsync(cancellationToken);
-        var selectedPreset = HoldKeyPresetCatalog.Resolve(config.HoldKeyVirtualKey);
-        log($"[App] hold key resolved, vk=0x{selectedPreset.VirtualKey:X}, name='{selectedPreset.DisplayName}'");
+        _config = await EnsureConfigAsync(cancellationToken);
+        _enableLiveCaption = _config.EnableLiveCaption || HasFlag("--enable-live-caption");
+        _enableManualSemanticLlm = _config.EnableManualSemanticLlm || HasFlag("--enable-semantic-llm");
+        _enableStickyDictationSemantic = _config.EnableStickyDictationSemantic;
 
-        Console.WriteLine("PressTalk is running.");
-        Console.WriteLine($"Hold key: {selectedPreset.DisplayName}");
-        Console.WriteLine($"Config file: {_configStore.ConfigPath}");
-        Console.WriteLine("Hold the selected key to start recording, release to commit.");
-        Console.WriteLine("Press hold-key + Space to lock dictation mode; press hold-key once to stop and commit.");
-        Console.WriteLine("Press ESC in this console window or Ctrl+C to exit.");
-        logger.Info("[App] Diagnostic log mode is enabled.");
+        ApplyFormConfig(_config);
+        _logger.Info("[App] UI mode enabled with floating button");
+        _log(
+            $"[App] settings loaded, holdKey={_config.HoldKeyName}, liveCaption={_enableLiveCaption}, manualSemantic={_enableManualSemanticLlm}, stickySemantic={_enableStickyDictationSemantic}, topMost={_config.AlwaysOnTop}");
 
         var commitMode = ResolveCommitMode(_args);
-        log($"[App] commit mode={commitMode}");
-        var committer = CreateCommitter(commitMode, log);
+        _log($"[App] commit mode={commitMode}");
+        var committer = CreateCommitter(commitMode, _log);
 
-        log("[App] audio mode=wasapi");
+        var runtimeSemanticEnabled = _enableManualSemanticLlm || _enableStickyDictationSemantic;
+        var runtimeOptions = BuildQwenRuntimeOptions(_args, runtimeSemanticEnabled, _log);
+        _log($"[App] asr mode=qwen, finalModel={runtimeOptions.AsrFinalModel}, previewModel={runtimeOptions.AsrPreviewModel}");
+        _log($"[App] qwen device={runtimeOptions.Device}");
+        _log(
+            $"[App] semantic llm runtime={(runtimeOptions.EnableSemanticLlm ? "on" : "off")}, manual={_enableManualSemanticLlm}, stickyDictation={_enableStickyDictationSemantic}, model={runtimeOptions.LlmModel}");
 
-        var enableSemanticLlm = _args.Any(a => string.Equals(a, "--enable-semantic-llm", StringComparison.OrdinalIgnoreCase));
-        var enableLiveCaption = _args.Any(a => string.Equals(a, "--enable-live-caption", StringComparison.OrdinalIgnoreCase));
-        var enableStickyDictationSemantic = true;
+        _runtime = new QwenRuntimeClient(runtimeOptions, _log);
+        await _runtime.EnsureReadyAsync(cancellationToken);
 
-        var runtimeOptions = BuildQwenRuntimeOptions(_args, enableSemanticLlm || enableStickyDictationSemantic, log);
-        log($"[App] asr mode=qwen, finalModel={runtimeOptions.AsrFinalModel}, previewModel={runtimeOptions.AsrPreviewModel}");
-        log($"[App] qwen device={runtimeOptions.Device}");
-        log($"[App] semantic llm runtime={(runtimeOptions.EnableSemanticLlm ? "on" : "off")}, manual={(enableSemanticLlm ? "on" : "off")} (use --enable-semantic-llm to turn on), stickyDictation={(enableStickyDictationSemantic ? "on" : "off")}, model={runtimeOptions.LlmModel}");
-        log($"[App] live caption={(enableLiveCaption ? "on" : "off")} (use --enable-live-caption to turn on)");
-
-        await using var qwenRuntime = new QwenRuntimeClient(runtimeOptions, log);
-        await qwenRuntime.EnsureReadyAsync(cancellationToken);
-
-        var asrBackend = new QwenAsrBackend(qwenRuntime, log);
-        var hasSelfCheck = HasSelfCheck(_args);
-
-        if (hasSelfCheck)
-        {
-            await RunSelfCheckAsync(asrBackend, log, cancellationToken);
-            return;
-        }
-
+        var asrBackend = new QwenAsrBackend(_runtime, _log);
         var textNormalizer = new AdaptiveSemanticNormalizer(
-            new RuleBasedNormalizer(log),
-            new QwenSemanticNormalizer(qwenRuntime, log),
-            log);
+            new RuleBasedNormalizer(_log),
+            new QwenSemanticNormalizer(_runtime, _log),
+            _log);
 
         var pipeline = new PressTalkPipeline(
             asrBackend,
             textNormalizer,
             committer,
-            log);
+            _log);
 
-        var windowTracker = new ForegroundWindowTracker(log);
-        var audioCapture = new WasapiAudioCaptureService(log);
-
-        var controller = new HoldToTalkController(
-            audioCapture,
+        _audioCapture = new WasapiAudioCaptureService(_log);
+        _windowTracker = new ForegroundWindowTracker(_log);
+        _controller = new HoldToTalkController(
+            _audioCapture,
             pipeline,
-            log: log);
+            log: _log);
 
-        using var hotkeyHook = new GlobalHoldKeyHook(config.HoldKeyVirtualKey, log);
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        using var warmupCts = new CancellationTokenSource();
-        Task? warmupTask = null;
-        var enableWarmup = _args.Any(a => string.Equals(a, "--enable-warmup", StringComparison.OrdinalIgnoreCase));
+        BindHotkey(_config.HoldKeyVirtualKey);
+        _workerTask = RunSessionWorkerAsync(_shutdownCts.Token);
 
-        var signalChannel = Channel.CreateUnbounded<HoldSignal>(
-            new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = false
-            });
+        Form.SetHintText("Click to settings");
+        _logger.Info("[App] Ready");
+    }
 
-        hotkeyHook.HoldStarted += () =>
+    public void Dispose()
+    {
+        ShutdownAsync().GetAwaiter().GetResult();
+        _shutdownCts.Dispose();
+        _hotkeyHook?.Dispose();
+        _runtime?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private async Task ShutdownAsync()
+    {
+        if (_shutdownCts.IsCancellationRequested)
         {
-            var enqueued = signalChannel.Writer.TryWrite(HoldSignal.Start);
-            log($"[App] enqueue signal Start, ok={enqueued}");
-        };
-        hotkeyHook.HoldEnded += () =>
-        {
-            var enqueued = signalChannel.Writer.TryWrite(HoldSignal.End);
-            log($"[App] enqueue signal End, ok={enqueued}");
-        };
-        hotkeyHook.StickyModeToggleRequested += () =>
-        {
-            var enqueued = signalChannel.Writer.TryWrite(HoldSignal.StickyModeToggle);
-            log($"[App] enqueue signal StickyModeToggle, ok={enqueued}");
-        };
-
-        var workerTask = RunSessionWorkerAsync(
-            controller,
-            windowTracker,
-            audioCapture,
-            qwenRuntime,
-            enableLiveCaption,
-            enableSemanticLlm,
-            enableStickyDictationSemantic,
-            signalChannel.Reader,
-            cts.Token,
-            log);
-
-        var loopThreadId = NativeMethods.GetCurrentThreadId();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            cts.Cancel();
-            NativeMethods.PostThreadMessage(loopThreadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-            log("[App] Ctrl+C received, shutting down");
-        };
-
-        var exitListenerTask = StartExitListenerAsync(loopThreadId, cts.Token, log);
-
-        hotkeyHook.Start();
-        log("[App] message loop started");
-
-        if (enableWarmup)
-        {
-            log("[App] warmup enabled");
-            warmupTask = Task.Run(
-                async () =>
-                {
-                    try
-                    {
-                        await qwenRuntime.WarmUpAsync(
-                            includePreview: !string.Equals(runtimeOptions.AsrFinalModel, runtimeOptions.AsrPreviewModel, StringComparison.Ordinal),
-                            cancellationToken: warmupCts.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Ignore cancellation during shutdown.
-                    }
-                    catch (Exception ex)
-                    {
-                        log($"[App] warmup failed: {ex.Message}");
-                    }
-                },
-                CancellationToken.None);
-        }
-        else
-        {
-            log("[App] warmup disabled by default (use --enable-warmup to turn on)");
+            return;
         }
 
-        while (true)
+        _shutdownCts.Cancel();
+        _signalChannel.Writer.TryComplete();
+
+        _hotkeyHook?.Dispose();
+        _hotkeyHook = null;
+
+        if (_workerTask is not null)
         {
-            var result = NativeMethods.GetMessage(out var message, IntPtr.Zero, 0, 0);
-            if (result == -1)
+            try
             {
-                throw new InvalidOperationException("Message loop failed.");
+                await _workerTask;
+            }
+            catch
+            {
+                // Ignore shutdown exceptions.
+            }
+        }
+
+        if (_runtime is not null)
+        {
+            try
+            {
+                await _runtime.DisposeAsync();
+            }
+            catch
+            {
+                // Ignore runtime shutdown exceptions.
             }
 
-            if (result == 0)
-            {
-                break;
-            }
-
-            NativeMethods.TranslateMessage(ref message);
-            NativeMethods.DispatchMessage(ref message);
-        }
-
-        cts.Cancel();
-        warmupCts.Cancel();
-        signalChannel.Writer.TryComplete();
-        log("[App] message loop ended");
-
-        await workerTask;
-        await exitListenerTask;
-        if (warmupTask is not null)
-        {
-            await Task.WhenAny(warmupTask, Task.Delay(1000, CancellationToken.None));
+            _runtime = null;
         }
     }
 
-    private async Task<AppUserConfig> EnsureConfigAsync(CancellationToken cancellationToken)
+    private void OpenSettingsDialog()
     {
-        var config = await _configStore.LoadAsync(cancellationToken);
-
-        if (config is not null && HoldKeyPresetCatalog.IsSupported(config.HoldKeyVirtualKey))
+        if (_config is null)
         {
-            return config;
+            return;
         }
 
-        Console.WriteLine("First launch setup: choose a hold key.");
-        var preset = FirstRunSetupWizard.SelectPreset();
-
-        var selected = new AppUserConfig
+        if (_isRecording)
         {
-            SchemaVersion = 1,
-            HoldKeyName = preset.DisplayName,
-            HoldKeyVirtualKey = preset.VirtualKey
-        };
+            MessageBox.Show(
+                "Stop recording before opening settings.",
+                "PressTalk",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
 
-        await _configStore.SaveAsync(selected, cancellationToken);
+        using var dialog = new SettingsForm(CloneConfig(_config));
+        if (dialog.ShowDialog(Form) != DialogResult.OK)
+        {
+            return;
+        }
 
-        Console.WriteLine($"Saved hold key: {preset.DisplayName}");
-        Console.WriteLine();
+        var updated = dialog.BuildUpdatedConfig(_config);
+        updated.FloatingWindowX = Form.Left;
+        updated.FloatingWindowY = Form.Top;
+        _config = updated;
 
-        return selected;
+        _enableLiveCaption = updated.EnableLiveCaption;
+        _enableManualSemanticLlm = updated.EnableManualSemanticLlm;
+        _enableStickyDictationSemantic = updated.EnableStickyDictationSemantic;
+
+        ApplyFormConfig(updated);
+        _log?.Invoke(
+            $"[App] settings updated, holdKey={updated.HoldKeyName}, liveCaption={_enableLiveCaption}, manualSemantic={_enableManualSemanticLlm}, stickySemantic={_enableStickyDictationSemantic}, topMost={updated.AlwaysOnTop}");
+
+        BindHotkey(updated.HoldKeyVirtualKey);
+        _configStore.SaveAsync(updated, CancellationToken.None).GetAwaiter().GetResult();
     }
 
-    private static Task StartExitListenerAsync(uint loopThreadId, CancellationToken cancellationToken, Action<string> log)
+    private void ApplyFormConfig(AppUserConfig config)
     {
-        return Task.Run(
-            () =>
-            {
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    if (!Console.KeyAvailable)
-                    {
-                        Thread.Sleep(100);
-                        continue;
-                    }
+        Form.SetHotkeyText(HoldKeyPresetCatalog.Resolve(config.HoldKeyVirtualKey).DisplayName);
+        Form.SetTopMost(config.AlwaysOnTop);
 
-                    var key = Console.ReadKey(intercept: true);
-                    if (key.Key == ConsoleKey.Escape)
-                    {
-                        log("[App] ESC received, shutting down");
-                        NativeMethods.PostThreadMessage(loopThreadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-                        return;
-                    }
-                }
-            },
-            CancellationToken.None);
+        var start = ResolveWindowLocation(config);
+        Form.Location = start;
     }
 
-    private static async Task RunSessionWorkerAsync(
-        HoldToTalkController controller,
-        ForegroundWindowTracker windowTracker,
-        WasapiAudioCaptureService audioCapture,
-        QwenRuntimeClient runtime,
-        bool enableLiveCaption,
-        bool enableManualSemanticLlm,
-        bool enableStickyDictationSemantic,
-        ChannelReader<HoldSignal> reader,
-        CancellationToken cancellationToken,
-        Action<string> log)
+    private Point ResolveWindowLocation(AppUserConfig config)
     {
-        var isRecording = false;
-        var isStickyDictationMode = false;
+        if (config.FloatingWindowX is int x && config.FloatingWindowY is int y)
+        {
+            return new Point(x, y);
+        }
+
+        var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
+        return new Point(area.Right - Form.Width - 32, Math.Max(area.Top + 24, area.Height / 4));
+    }
+
+    private void SaveWindowPosition()
+    {
+        if (_config is null)
+        {
+            return;
+        }
+
+        _config.FloatingWindowX = Form.Left;
+        _config.FloatingWindowY = Form.Top;
+        _configStore.SaveAsync(_config, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    private void BindHotkey(uint virtualKey)
+    {
+        _hotkeyHook?.Dispose();
+        _hotkeyHook = new GlobalHoldKeyHook(virtualKey, _log);
+        _hotkeyHook.HoldStarted += OnHotkeyStarted;
+        _hotkeyHook.HoldEnded += OnHotkeyEnded;
+        _hotkeyHook.StickyModeToggleRequested += OnStickyToggleRequested;
+        _hotkeyHook.Start();
+    }
+
+    private void OnHotkeyStarted()
+    {
+        _isHotkeyPressed = true;
+        UpdateButtonVisual();
+        var ok = _signalChannel.Writer.TryWrite(HoldSignal.Start);
+        _log?.Invoke($"[App] enqueue signal Start, ok={ok}");
+    }
+
+    private void OnHotkeyEnded()
+    {
+        _isHotkeyPressed = false;
+        UpdateButtonVisual();
+        var ok = _signalChannel.Writer.TryWrite(HoldSignal.End);
+        _log?.Invoke($"[App] enqueue signal End, ok={ok}");
+    }
+
+    private void OnStickyToggleRequested()
+    {
+        var ok = _signalChannel.Writer.TryWrite(HoldSignal.StickyModeToggle);
+        _log?.Invoke($"[App] enqueue signal StickyModeToggle, ok={ok}");
+    }
+
+    private void UpdateButtonVisual()
+    {
+        Form.SetVisualState(
+            isPressed: _isHotkeyPressed,
+            isRecording: _isRecording,
+            isSticky: _isStickyRecording);
+    }
+
+    private async Task RunSessionWorkerAsync(CancellationToken cancellationToken)
+    {
+        if (_controller is null || _windowTracker is null || _audioCapture is null || _runtime is null)
+        {
+            throw new InvalidOperationException("Worker started before initialization.");
+        }
+
         Task? liveCaptionTask = null;
         CancellationTokenSource? liveCaptionCts = null;
+        var stickyMode = false;
 
         async Task StopAndCommitAsync()
         {
@@ -336,103 +403,116 @@ internal sealed class PressTalkConsoleApp
 
                 if (completed != liveCaptionTask)
                 {
-                    log("[App.Live] caption loop did not stop within 150ms; proceeding with commit");
+                    _log?.Invoke("[App.Live] caption loop did not stop within 150ms; proceeding with commit");
                 }
             }
 
-            if (enableLiveCaption)
-            {
-                Console.WriteLine("[PressTalk.Live] ");
-            }
-
-            var activated = windowTracker.TryActivateCapturedWindow();
-            log($"[App.Worker] target activation result={activated}");
+            var activated = _windowTracker.TryActivateCapturedWindow();
+            _log?.Invoke($"[App.Worker] target activation result={activated}");
             await Task.Delay(30, cancellationToken);
-            var result = await controller.OnReleaseAsync(
-                cancellationToken,
-                isStickyDictationMode: isStickyDictationMode,
-                enableSemanticEnhancement: enableManualSemanticLlm || (enableStickyDictationSemantic && isStickyDictationMode));
 
-            var semanticEnabledForSession = enableManualSemanticLlm || (enableStickyDictationSemantic && isStickyDictationMode);
+            var semanticEnabledForSession =
+                _enableManualSemanticLlm
+                || (_enableStickyDictationSemantic && stickyMode);
+
+            var result = await _controller.OnReleaseAsync(
+                cancellationToken,
+                isStickyDictationMode: stickyMode,
+                enableSemanticEnhancement: semanticEnabledForSession);
+
             var semanticCandidateChars = result.RawText.Trim().Length;
             var semanticExpected = semanticEnabledForSession && semanticCandidateChars >= StickySemanticMinChars;
-            log(
-                $"[App.Worker] commit completed, session={result.SessionId}, stickyDictation={isStickyDictationMode}, semanticEnabled={semanticEnabledForSession}, semanticCandidateChars={semanticCandidateChars}, semanticExpected={semanticExpected}");
-            Console.WriteLine($"[PressTalk] {DateTime.Now:HH:mm:ss} -> {result.NormalizedText}");
+            _log?.Invoke(
+                $"[App.Worker] commit completed, session={result.SessionId}, stickyDictation={stickyMode}, semanticEnabled={semanticEnabledForSession}, semanticCandidateChars={semanticCandidateChars}, semanticExpected={semanticExpected}");
         }
 
         try
         {
-            while (await reader.WaitToReadAsync(cancellationToken))
+            while (await _signalChannel.Reader.WaitToReadAsync(cancellationToken))
             {
-                while (reader.TryRead(out var signal))
+                while (_signalChannel.Reader.TryRead(out var signal))
                 {
-                    log($"[App.Worker] dequeued signal={signal}, isRecording={isRecording}, sticky={isStickyDictationMode}");
+                    _log?.Invoke($"[App.Worker] dequeued signal={signal}, isRecording={_isRecording}, sticky={stickyMode}");
 
-                    if (signal == HoldSignal.StickyModeToggle && isRecording && !isStickyDictationMode)
+                    if (signal == HoldSignal.StickyModeToggle && _isRecording && !stickyMode)
                     {
-                        isStickyDictationMode = true;
-                        Console.WriteLine("[PressTalk] Sticky dictation ON. Press hold key once to stop.");
-                        log("[App.Worker] sticky dictation enabled");
+                        stickyMode = true;
+                        _isStickyRecording = true;
+                        UpdateButtonVisual();
+                        Form.SetHintText("Sticky ON, press hotkey again to stop");
+                        _log?.Invoke("[App.Worker] sticky dictation enabled");
                         continue;
                     }
 
-                    if (signal == HoldSignal.Start && !isRecording)
+                    if (signal == HoldSignal.Start && !_isRecording)
                     {
                         try
                         {
-                            windowTracker.CaptureAtPress();
-                            var sessionId = await controller.OnPressAsync("auto", cancellationToken);
-                            isRecording = true;
-                            isStickyDictationMode = false;
-                            Console.WriteLine("[PressTalk] Recording started...");
-                            log("[App.Worker] recording started");
+                            _windowTracker.CaptureAtPress();
+                            var sessionId = await _controller.OnPressAsync("auto", cancellationToken);
+                            _isRecording = true;
+                            stickyMode = false;
+                            _isStickyRecording = false;
+                            Form.SetHintText("Recording...");
+                            UpdateButtonVisual();
+                            _log?.Invoke($"[App.Worker] recording started, session={sessionId}");
 
-                            if (enableLiveCaption)
+                            if (_enableLiveCaption)
                             {
                                 liveCaptionCts = new CancellationTokenSource();
                                 liveCaptionTask = RunLiveCaptionLoopAsync(
                                     sessionId,
-                                    audioCapture,
-                                    runtime,
+                                    _audioCapture,
+                                    _runtime,
                                     liveCaptionCts.Token,
-                                    log);
+                                    _log!);
                             }
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[PressTalk] Failed to start recording: {ex.Message}");
-                            log($"[App.Worker] start failed: {ex}");
+                            _log?.Invoke($"[App.Worker] start failed: {ex}");
+                            _isRecording = false;
+                            stickyMode = false;
+                            _isStickyRecording = false;
+                            UpdateButtonVisual();
+                            Form.SetHintText("Start failed, click to settings");
                         }
+
+                        continue;
                     }
-                    else if (signal == HoldSignal.Start && isRecording && isStickyDictationMode)
+
+                    if (signal == HoldSignal.Start && _isRecording && stickyMode)
                     {
                         try
                         {
-                            log("[App.Worker] sticky stop requested by hold-key press");
+                            _log?.Invoke("[App.Worker] sticky stop requested by hotkey press");
                             await StopAndCommitAsync();
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[PressTalk] Failed to commit: {ex.Message}");
-                            log($"[App.Worker] commit failed: {ex}");
+                            _log?.Invoke($"[App.Worker] commit failed: {ex}");
                         }
                         finally
                         {
                             liveCaptionTask = null;
                             liveCaptionCts?.Dispose();
                             liveCaptionCts = null;
-                            isRecording = false;
-                            isStickyDictationMode = false;
-                            log("[App.Worker] recording reset");
+                            _isRecording = false;
+                            stickyMode = false;
+                            _isStickyRecording = false;
+                            _isHotkeyPressed = false;
+                            Form.SetHintText("Click to settings");
+                            UpdateButtonVisual();
                         }
+
+                        continue;
                     }
 
-                    if (signal == HoldSignal.End && isRecording)
+                    if (signal == HoldSignal.End && _isRecording)
                     {
-                        if (isStickyDictationMode)
+                        if (stickyMode)
                         {
-                            log("[App.Worker] hold-key release ignored because sticky dictation is active");
+                            _log?.Invoke("[App.Worker] hold-key release ignored because sticky dictation is active");
                             continue;
                         }
 
@@ -442,17 +522,19 @@ internal sealed class PressTalkConsoleApp
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[PressTalk] Failed to commit: {ex.Message}");
-                            log($"[App.Worker] commit failed: {ex}");
+                            _log?.Invoke($"[App.Worker] commit failed: {ex}");
                         }
                         finally
                         {
                             liveCaptionTask = null;
                             liveCaptionCts?.Dispose();
                             liveCaptionCts = null;
-                            isRecording = false;
-                            isStickyDictationMode = false;
-                            log("[App.Worker] recording reset");
+                            _isRecording = false;
+                            stickyMode = false;
+                            _isStickyRecording = false;
+                            _isHotkeyPressed = false;
+                            Form.SetHintText("Click to settings");
+                            UpdateButtonVisual();
                         }
                     }
                 }
@@ -460,7 +542,7 @@ internal sealed class PressTalkConsoleApp
         }
         catch (OperationCanceledException)
         {
-            log("[App.Worker] canceled");
+            _log?.Invoke("[App.Worker] canceled");
         }
         finally
         {
@@ -478,11 +560,15 @@ internal sealed class PressTalkConsoleApp
                 }
                 catch
                 {
-                    // Ignore background caption errors during shutdown.
+                    // Ignore preview errors during shutdown.
                 }
             }
 
-            audioCapture.ForceStop();
+            _audioCapture.ForceStop();
+            _isRecording = false;
+            _isStickyRecording = false;
+            _isHotkeyPressed = false;
+            UpdateButtonVisual();
         }
     }
 
@@ -529,7 +615,6 @@ internal sealed class PressTalkConsoleApp
                 }
 
                 lastPreview = text;
-                Console.WriteLine($"[PressTalk.Live] {DateTime.Now:HH:mm:ss} {text}");
                 log($"[App.Live] preview updated, session={sessionId}, textLen={text.Length}, durationMs={preview.Duration.TotalMilliseconds:F1}");
             }
             catch (OperationCanceledException)
@@ -544,24 +629,63 @@ internal sealed class PressTalkConsoleApp
         }
     }
 
+    private async Task<AppUserConfig> EnsureConfigAsync(CancellationToken cancellationToken)
+    {
+        var config = await _configStore.LoadAsync(cancellationToken);
+
+        if (config is not null && HoldKeyPresetCatalog.IsSupported(config.HoldKeyVirtualKey))
+        {
+            return config;
+        }
+
+        var preset = HoldKeyPresetCatalog.Default;
+        var selected = new AppUserConfig
+        {
+            SchemaVersion = 1,
+            HoldKeyName = preset.DisplayName,
+            HoldKeyVirtualKey = preset.VirtualKey,
+            EnableLiveCaption = false,
+            EnableManualSemanticLlm = false,
+            EnableStickyDictationSemantic = true,
+            AlwaysOnTop = true
+        };
+
+        await _configStore.SaveAsync(selected, cancellationToken);
+        return selected;
+    }
+
+    private static AppUserConfig CloneConfig(AppUserConfig source)
+    {
+        return new AppUserConfig
+        {
+            SchemaVersion = source.SchemaVersion,
+            HoldKeyName = source.HoldKeyName,
+            HoldKeyVirtualKey = source.HoldKeyVirtualKey,
+            EnableLiveCaption = source.EnableLiveCaption,
+            EnableManualSemanticLlm = source.EnableManualSemanticLlm,
+            EnableStickyDictationSemantic = source.EnableStickyDictationSemantic,
+            AlwaysOnTop = source.AlwaysOnTop,
+            FloatingWindowX = source.FloatingWindowX,
+            FloatingWindowY = source.FloatingWindowY
+        };
+    }
+
+    private bool HasFlag(string flag)
+    {
+        return _args.Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string ResolveCommitMode(string[] args)
     {
         const string prefix = "--commit-mode=";
-        var arg = args.FirstOrDefault(
-            a => a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-
+        var arg = args.FirstOrDefault(a => a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
         if (arg is null)
         {
             return "paste";
         }
 
         var mode = arg[prefix.Length..].Trim().ToLowerInvariant();
-        if (mode is "sendinput" or "paste")
-        {
-            return mode;
-        }
-
-        return "paste";
+        return mode is "sendinput" or "paste" ? mode : "paste";
     }
 
     private static ITextCommitter CreateCommitter(string mode, Action<string> log)
@@ -571,21 +695,6 @@ internal sealed class PressTalkConsoleApp
             "sendinput" => new SendInputTextCommitter(log),
             _ => new ClipboardPasteTextCommitter(log)
         };
-    }
-
-    private static bool HasSelfCheck(string[] args)
-    {
-        return args.Any(a => string.Equals(a, "--self-check", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static async Task RunSelfCheckAsync(IAsrBackend backend, Action<string> log, CancellationToken cancellationToken)
-    {
-        log("[App.SelfCheck] started");
-        var oneSecondSilence = new float[16000];
-        var result = await backend.TranscribeAsync(oneSecondSilence, 16000, cancellationToken);
-        log($"[App.SelfCheck] asr returned textLen={result.Text.Length}, durationMs={result.Duration.TotalMilliseconds:F1}");
-        log($"[App.SelfCheck] asr text='{result.Text}'");
-        log("[App.SelfCheck] finished");
     }
 
     private static QwenRuntimeOptions BuildQwenRuntimeOptions(string[] args, bool enableSemanticLlm, Action<string> log)
@@ -643,7 +752,7 @@ internal sealed class PressTalkConsoleApp
     {
         try
         {
-            var startInfo = new System.Diagnostics.ProcessStartInfo
+            var startInfo = new ProcessStartInfo
             {
                 FileName = pythonExecutable,
                 UseShellExecute = false,
@@ -655,7 +764,7 @@ internal sealed class PressTalkConsoleApp
             startInfo.ArgumentList.Add("-c");
             startInfo.ArgumentList.Add("import torch; print('cuda:0' if torch.cuda.is_available() else 'cpu')");
 
-            using var process = System.Diagnostics.Process.Start(startInfo);
+            using var process = Process.Start(startInfo);
             if (process is null)
             {
                 log("[App] device detect failed to start python, fallback=cpu");
@@ -664,7 +773,15 @@ internal sealed class PressTalkConsoleApp
 
             if (!process.WaitForExit(7000))
             {
-                try { process.Kill(entireProcessTree: true); } catch { }
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Ignore cleanup failure.
+                }
+
                 log("[App] device detect timeout, fallback=cpu");
                 return "cpu";
             }
