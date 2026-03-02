@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PressTalk.Contracts\PressTalk.Contracts.csproj" />
+    <ProjectReference Include="..\PressTalk.Asr\PressTalk.Asr.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,32 @@
+# Build output
+bin/
+obj/
+out/
+artifacts/
+dist/
+
+# User and IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+
+# Logs and temp files
+*.log
+*.tmp
+*.cache
+.tmp-*/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Models and local runtime data
+models/*
+!models/.gitkeep
+data/
+
+# Test results
+TestResults/
+coverage/

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PressTalk.Asr\PressTalk.Asr.csproj" />
+    <ProjectReference Include="..\PressTalk.Audio\PressTalk.Audio.csproj" />
+    <ProjectReference Include="..\PressTalk.Commit\PressTalk.Commit.csproj" />
+    <ProjectReference Include="..\PressTalk.Contracts\PressTalk.Contracts.csproj" />
+    <ProjectReference Include="..\PressTalk.Engine\PressTalk.Engine.csproj" />
+    <ProjectReference Include="..\PressTalk.Normalize\PressTalk.Normalize.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\PressTalk.Asr\qwen_runtime.py" Link="qwen_runtime.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+</Project>
