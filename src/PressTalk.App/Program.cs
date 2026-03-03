@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Channels;
 using System.Windows.Forms;
@@ -23,21 +24,19 @@ internal static class Program
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Console.OutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-        Console.InputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
         using var host = new PressTalkUiHost(args);
 
         try
         {
-            host.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
+            host.Form.Shown += (_, _) => host.StartInitialization();
             Application.Run(host.Form);
-            return 0;
+            return host.ExitCode;
         }
         catch (Exception ex)
         {
             MessageBox.Show(
-                $"PressTalk startup failed:\n\n{ex.Message}",
+                $"PressTalk 启动失败：\n\n{ex.Message}",
                 "PressTalk",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -133,6 +132,9 @@ internal sealed class PressTalkUiHost : IDisposable
     private bool _isRecording;
     private bool _isStickyRecording;
     private bool _isHotkeyPressed;
+    private bool _initialized;
+    private bool _initializationStarted;
+    private bool _hotkeyConflictActive;
 
     private bool _enableLiveCaption;
     private bool _enableManualSemanticLlm;
@@ -142,6 +144,7 @@ internal sealed class PressTalkUiHost : IDisposable
     {
         _args = args;
         Form = new FloatingRecorderForm();
+        Form.SetHintText("启动中...");
         Form.FormClosing += (_, _) =>
         {
             SaveWindowPosition();
@@ -151,6 +154,64 @@ internal sealed class PressTalkUiHost : IDisposable
     }
 
     public FloatingRecorderForm Form { get; }
+    public int ExitCode { get; private set; }
+
+    public void StartInitialization()
+    {
+        if (_initializationStarted)
+        {
+            return;
+        }
+
+        _initializationStarted = true;
+        _ = InitializeInBackgroundAsync();
+    }
+
+    private async Task InitializeInBackgroundAsync()
+    {
+        try
+        {
+            await InitializeAsync(_shutdownCts.Token);
+            _initialized = true;
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown.
+        }
+        catch (Exception ex)
+        {
+            ExitCode = 1;
+            _logger?.Error($"[App] background initialization failed: {ex}");
+            if (Form.IsDisposed)
+            {
+                return;
+            }
+
+            if (Form.InvokeRequired)
+            {
+                Form.BeginInvoke(new MethodInvoker(() => ShowInitFailureAndClose(ex)));
+                return;
+            }
+
+            ShowInitFailureAndClose(ex);
+        }
+    }
+
+    private void ShowInitFailureAndClose(Exception ex)
+    {
+        if (Form.IsDisposed)
+        {
+            return;
+        }
+
+        MessageBox.Show(
+            Form,
+            $"PressTalk 启动失败：\n\n{ex.Message}",
+            "PressTalk",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error);
+        Form.Close();
+    }
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
@@ -212,8 +273,8 @@ internal sealed class PressTalkUiHost : IDisposable
 
         BindHotkey(_config.HoldKeyVirtualKey);
         _workerTask = RunSessionWorkerAsync(_shutdownCts.Token);
-
-        Form.SetHintText("Click to settings");
+        _ = PreloadRuntimeAsync(_enableLiveCaption, runtimeSemanticEnabled);
+        Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
         _logger.Info("[App] Ready");
     }
 
@@ -267,6 +328,17 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private void OpenSettingsDialog()
     {
+        if (!_initialized)
+        {
+            MessageBox.Show(
+                Form,
+                "PressTalk 仍在启动，请稍后再试。",
+                "PressTalk",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
         if (_config is null)
         {
             return;
@@ -275,7 +347,7 @@ internal sealed class PressTalkUiHost : IDisposable
         if (_isRecording)
         {
             MessageBox.Show(
-                "Stop recording before opening settings.",
+                "请先停止录音，再打开设置。",
                 "PressTalk",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -316,13 +388,26 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private Point ResolveWindowLocation(AppUserConfig config)
     {
-        if (config.FloatingWindowX is int x && config.FloatingWindowY is int y)
+        static Point ClampToArea(Point point, Rectangle workArea, Size formSize)
         {
-            return new Point(x, y);
+            var maxX = Math.Max(workArea.Left, workArea.Right - formSize.Width);
+            var maxY = Math.Max(workArea.Top, workArea.Bottom - formSize.Height);
+            var clampedX = Math.Clamp(point.X, workArea.Left, maxX);
+            var clampedY = Math.Clamp(point.Y, workArea.Top, maxY);
+            return new Point(clampedX, clampedY);
         }
 
-        var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
-        return new Point(area.Right - Form.Width - 32, Math.Max(area.Top + 24, area.Height / 4));
+        if (config.FloatingWindowX is int x && config.FloatingWindowY is int y)
+        {
+            var target = new Point(x, y);
+            var targetScreen = Screen.AllScreens.FirstOrDefault(s => s.WorkingArea.Contains(target));
+            var savedArea = targetScreen?.WorkingArea ?? (Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080));
+            return ClampToArea(target, savedArea, Form.Size);
+        }
+
+        var defaultArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
+        var fallback = new Point(defaultArea.Right - Form.Width - 32, Math.Max(defaultArea.Top + 24, defaultArea.Height / 4));
+        return ClampToArea(fallback, defaultArea, Form.Size);
     }
 
     private void SaveWindowPosition()
@@ -340,6 +425,20 @@ internal sealed class PressTalkUiHost : IDisposable
     private void BindHotkey(uint virtualKey)
     {
         _hotkeyHook?.Dispose();
+        _hotkeyHook = null;
+        _hotkeyConflictActive = false;
+
+        if (IsGlobalHotkeyOccupied(virtualKey))
+        {
+            _hotkeyConflictActive = true;
+            _log?.Invoke($"[Hotkey.Hook] bind blocked by conflict, vk=0x{virtualKey:X}");
+            Form.SetHintText("热键冲突，请改键");
+            ShowWarning(
+                $"热键 {HoldKeyPresetCatalog.Resolve(virtualKey).DisplayName} 被其他程序占用，请到设置中更换。");
+            UpdateButtonVisual();
+            return;
+        }
+
         _hotkeyHook = new GlobalHoldKeyHook(virtualKey, _log);
         _hotkeyHook.HoldStarted += OnHotkeyStarted;
         _hotkeyHook.HoldEnded += OnHotkeyEnded;
@@ -349,6 +448,18 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private void OnHotkeyStarted()
     {
+        if (!_initialized)
+        {
+            _log?.Invoke("[App] hotkey start ignored: initialization not completed");
+            return;
+        }
+
+        if (_hotkeyConflictActive)
+        {
+            _log?.Invoke("[App] hotkey start ignored: hotkey conflict active");
+            return;
+        }
+
         _isHotkeyPressed = true;
         UpdateButtonVisual();
         var ok = _signalChannel.Writer.TryWrite(HoldSignal.Start);
@@ -357,6 +468,18 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private void OnHotkeyEnded()
     {
+        if (!_initialized)
+        {
+            _log?.Invoke("[App] hotkey end ignored: initialization not completed");
+            return;
+        }
+
+        if (_hotkeyConflictActive)
+        {
+            _log?.Invoke("[App] hotkey end ignored: hotkey conflict active");
+            return;
+        }
+
         _isHotkeyPressed = false;
         UpdateButtonVisual();
         var ok = _signalChannel.Writer.TryWrite(HoldSignal.End);
@@ -365,6 +488,18 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private void OnStickyToggleRequested()
     {
+        if (!_initialized)
+        {
+            _log?.Invoke("[App] sticky toggle ignored: initialization not completed");
+            return;
+        }
+
+        if (_hotkeyConflictActive)
+        {
+            _log?.Invoke("[App] sticky toggle ignored: hotkey conflict active");
+            return;
+        }
+
         var ok = _signalChannel.Writer.TryWrite(HoldSignal.StickyModeToggle);
         _log?.Invoke($"[App] enqueue signal StickyModeToggle, ok={ok}");
     }
@@ -439,7 +574,7 @@ internal sealed class PressTalkUiHost : IDisposable
                         stickyMode = true;
                         _isStickyRecording = true;
                         UpdateButtonVisual();
-                        Form.SetHintText("Sticky ON, press hotkey again to stop");
+                        Form.SetHintText("长文模式，按热键结束");
                         _log?.Invoke("[App.Worker] sticky dictation enabled");
                         continue;
                     }
@@ -453,7 +588,7 @@ internal sealed class PressTalkUiHost : IDisposable
                             _isRecording = true;
                             stickyMode = false;
                             _isStickyRecording = false;
-                            Form.SetHintText("Recording...");
+                            Form.SetHintText("正在录音...");
                             UpdateButtonVisual();
                             _log?.Invoke($"[App.Worker] recording started, session={sessionId}");
 
@@ -475,7 +610,7 @@ internal sealed class PressTalkUiHost : IDisposable
                             stickyMode = false;
                             _isStickyRecording = false;
                             UpdateButtonVisual();
-                            Form.SetHintText("Start failed, click to settings");
+                            Form.SetHintText("启动失败，点击设置");
                         }
 
                         continue;
@@ -501,7 +636,7 @@ internal sealed class PressTalkUiHost : IDisposable
                             stickyMode = false;
                             _isStickyRecording = false;
                             _isHotkeyPressed = false;
-                            Form.SetHintText("Click to settings");
+                            Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
                             UpdateButtonVisual();
                         }
 
@@ -533,7 +668,7 @@ internal sealed class PressTalkUiHost : IDisposable
                             stickyMode = false;
                             _isStickyRecording = false;
                             _isHotkeyPressed = false;
-                            Form.SetHintText("Click to settings");
+                            Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
                             UpdateButtonVisual();
                         }
                     }
@@ -860,5 +995,68 @@ internal sealed class PressTalkUiHost : IDisposable
 
         var value = arg[prefix.Length..].Trim();
         return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    private bool IsGlobalHotkeyOccupied(uint virtualKey)
+    {
+        if (!NativeMethods.RegisterHotKey(IntPtr.Zero, NativeMethods.HOTKEY_ID_PROBE, NativeMethods.MOD_NONE, virtualKey))
+        {
+            var error = Marshal.GetLastWin32Error();
+            if (error == NativeMethods.HOTKEY_ALREADY_REGISTERED)
+            {
+                return true;
+            }
+
+            _log?.Invoke($"[Hotkey.Hook] probe failed, vk=0x{virtualKey:X}, error={error}");
+            return false;
+        }
+
+        NativeMethods.UnregisterHotKey(IntPtr.Zero, NativeMethods.HOTKEY_ID_PROBE);
+        return false;
+    }
+
+    private async Task PreloadRuntimeAsync(bool includePreview, bool includeSemantic)
+    {
+        if (_runtime is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.Delay(1200, CancellationToken.None);
+            if (_isRecording)
+            {
+                _log?.Invoke("[App] runtime preload skipped: recording already active");
+                return;
+            }
+
+            await _runtime.PreloadAsync(includePreview, includeSemantic, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"[App] runtime preload skipped: {ex.Message}");
+        }
+    }
+
+    private void ShowWarning(string message)
+    {
+        if (Form.IsDisposed)
+        {
+            return;
+        }
+
+        if (Form.InvokeRequired)
+        {
+            Form.BeginInvoke(new MethodInvoker(() => ShowWarning(message)));
+            return;
+        }
+
+        MessageBox.Show(
+            Form,
+            message,
+            "PressTalk",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
     }
 }

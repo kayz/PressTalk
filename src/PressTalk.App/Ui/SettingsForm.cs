@@ -15,7 +15,7 @@ public sealed class SettingsForm : Form
 
     public SettingsForm(AppUserConfig currentConfig)
     {
-        Text = "PressTalk Settings";
+        Text = "PressTalk 设置";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false;
@@ -38,7 +38,7 @@ public sealed class SettingsForm : Form
 
         Controls.Add(panel);
 
-        panel.Controls.Add(MakeTitle("Hotkey"), 0, 0);
+        panel.Controls.Add(MakeTitle("热键"), 0, 0);
         _hotkeyComboBox = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
@@ -52,30 +52,30 @@ public sealed class SettingsForm : Form
         var selectedPreset = HoldKeyPresetCatalog.Resolve(currentConfig.HoldKeyVirtualKey);
         _hotkeyComboBox.SelectedItem = HoldKeyPresetCatalog.All.First(p => p.VirtualKey == selectedPreset.VirtualKey);
         panel.Controls.Add(_hotkeyComboBox, 0, 1);
-        panel.Controls.Add(MakeHint("Use one function key. F8 is the default and avoids accidental triggers."), 0, 2);
+        panel.Controls.Add(MakeHint("建议使用单个功能键。默认 F8，误触更少。"), 0, 2);
 
-        panel.Controls.Add(MakeTitle("Behavior"), 0, 3);
+        panel.Controls.Add(MakeTitle("行为"), 0, 3);
         _stickySemanticCheckBox = MakeCheckBox(
-            "Long dictation mode uses light semantic cleanup",
+            "长文模式启用轻量语义润色",
             currentConfig.EnableStickyDictationSemantic);
         panel.Controls.Add(_stickySemanticCheckBox, 0, 4);
 
         _manualSemanticCheckBox = MakeCheckBox(
-            "Normal mode also uses semantic cleanup",
+            "普通模式也启用语义润色",
             currentConfig.EnableManualSemanticLlm);
         panel.Controls.Add(_manualSemanticCheckBox, 0, 5);
 
         _liveCaptionCheckBox = MakeCheckBox(
-            "Show live caption preview while recording",
+            "录音时显示实时预览",
             currentConfig.EnableLiveCaption);
         panel.Controls.Add(_liveCaptionCheckBox, 0, 6);
 
         _alwaysOnTopCheckBox = MakeCheckBox(
-            "Keep floating button always on top",
+            "悬浮按钮始终置顶",
             currentConfig.AlwaysOnTop);
         panel.Controls.Add(_alwaysOnTopCheckBox, 0, 7);
 
-        panel.Controls.Add(MakeHint("Long dictation mode is entered with hold-key + Space, then press the hold-key again to stop."), 0, 8);
+        panel.Controls.Add(MakeHint("按住热键 + 空格进入长文模式，再按一次热键结束。"), 0, 8);
 
         var buttons = new FlowLayoutPanel
         {
@@ -87,13 +87,13 @@ public sealed class SettingsForm : Form
 
         var saveButton = new Button
         {
-            Text = "Save",
+            Text = "保存",
             DialogResult = DialogResult.OK,
             AutoSize = true
         };
         var cancelButton = new Button
         {
-            Text = "Cancel",
+            Text = "取消",
             DialogResult = DialogResult.Cancel,
             AutoSize = true
         };

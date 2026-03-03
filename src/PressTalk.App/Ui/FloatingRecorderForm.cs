@@ -7,7 +7,7 @@ public sealed class FloatingRecorderForm : Form
 {
     private readonly CircleHotkeyButton _button;
     private readonly Label _hintLabel;
-    private readonly Panel _root;
+    private readonly ContextMenuStrip _contextMenu;
     private bool _dragging;
     private Point _dragOrigin;
 
@@ -16,44 +16,59 @@ public sealed class FloatingRecorderForm : Form
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.Manual;
-        Width = 132;
-        Height = 152;
-        BackColor = Color.FromArgb(24, 26, 33);
-        ForeColor = Color.White;
+        Width = 106;
+        Height = 126;
         TopMost = true;
         DoubleBuffered = true;
-
-        _root = new Panel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(24, 26, 33)
-        };
-        Controls.Add(_root);
+        BackColor = Color.Magenta;
+        TransparencyKey = Color.Magenta;
 
         _button = new CircleHotkeyButton
         {
-            Width = 108,
-            Height = 108,
-            Left = 12,
-            Top = 10
+            Width = 86,
+            Height = 86,
+            Left = (Width - 86) / 2,
+            Top = 6
         };
         _button.Click += (_, _) => SettingsRequested?.Invoke(this, EventArgs.Empty);
-        _root.Controls.Add(_button);
+        Controls.Add(_button);
 
         _hintLabel = new Label
         {
             AutoSize = false,
             Width = Width,
-            Height = 24,
+            Height = 26,
             Left = 0,
-            Top = 122,
+            Top = 96,
             TextAlign = ContentAlignment.MiddleCenter,
-            ForeColor = Color.FromArgb(170, 180, 195),
-            Text = "Click to settings"
+            ForeColor = Color.White,
+            BackColor = Color.Transparent,
+            Text = "点击按钮设置"
         };
-        _root.Controls.Add(_hintLabel);
+        Controls.Add(_hintLabel);
 
-        BindDrag(_root);
+        _contextMenu = new ContextMenuStrip();
+        var exitItem = new ToolStripMenuItem("退出");
+        exitItem.Click += (_, _) =>
+        {
+            var result = MessageBox.Show(
+                this,
+                "确认退出 PressTalk 吗？",
+                "退出确认",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (result == DialogResult.Yes)
+            {
+                Close();
+            }
+        };
+        _contextMenu.Items.Add(exitItem);
+
+        BindRightClick(this);
+        BindRightClick(_button);
+        BindRightClick(_hintLabel);
+        BindDrag(this);
+        BindDrag(_button);
         BindDrag(_hintLabel);
     }
 
@@ -139,6 +154,19 @@ public sealed class FloatingRecorderForm : Form
             }
         };
     }
+
+    private void BindRightClick(Control control)
+    {
+        control.MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right)
+            {
+                return;
+            }
+
+            _contextMenu.Show(control, e.Location);
+        };
+    }
 }
 
 internal sealed class CircleHotkeyButton : Control
@@ -154,9 +182,11 @@ internal sealed class CircleHotkeyButton : Control
             ControlStyles.AllPaintingInWmPaint
             | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.ResizeRedraw
+            | ControlStyles.SupportsTransparentBackColor
             | ControlStyles.UserPaint,
             true);
 
+        BackColor = Color.Transparent;
         Cursor = Cursors.Hand;
     }
 
@@ -167,38 +197,66 @@ internal sealed class CircleHotkeyButton : Control
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
 
         var bounds = ClientRectangle;
-        var circle = new RectangleF(6, 6, bounds.Width - 12, bounds.Height - 12);
-        var shadowOffset = IsPressed ? 1f : 5f;
-        var pressOffset = IsPressed ? 2f : 0f;
+        var baseCircle = new RectangleF(4, 4, bounds.Width - 8, bounds.Height - 8);
+        var depressed = IsPressed || IsSticky;
+        var pressOffset = depressed ? 2.5f : 0f;
+        var shadowOffset = depressed ? 1.2f : 4.8f;
 
-        using var shadowBrush = new SolidBrush(Color.FromArgb(60, 0, 0, 0));
-        var shadowRect = circle;
-        shadowRect.Offset(0, shadowOffset);
-        e.Graphics.FillEllipse(shadowBrush, shadowRect);
+        using var shadowBrush = new SolidBrush(Color.FromArgb(72, 0, 0, 0));
+        var shadowCircle = baseCircle;
+        shadowCircle.Offset(0, shadowOffset);
+        e.Graphics.FillEllipse(shadowBrush, shadowCircle);
 
-        var fill = IsSticky
-            ? Color.FromArgb(255, 173, 66)
-            : (IsRecording ? Color.FromArgb(234, 67, 53) : Color.FromArgb(45, 140, 255));
+        var circle = baseCircle;
+        circle.Offset(0, pressOffset);
+
         using var fillBrush = new LinearGradientBrush(
             circle,
-            ControlPaint.Light(fill, 0.12f),
-            ControlPaint.Dark(fill, 0.12f),
+            Color.FromArgb(252, 252, 252),
+            Color.FromArgb(214, 214, 214),
             LinearGradientMode.ForwardDiagonal);
-        var circleRect = circle;
-        circleRect.Offset(0, pressOffset);
-        e.Graphics.FillEllipse(fillBrush, circleRect);
+        e.Graphics.FillEllipse(fillBrush, circle);
 
-        using var borderPen = new Pen(Color.FromArgb(230, 255, 255, 255), 2f);
-        e.Graphics.DrawEllipse(borderPen, circleRect);
+        using var borderPen = new Pen(Color.FromArgb(236, 236, 236), 1.8f);
+        e.Graphics.DrawEllipse(borderPen, circle);
 
-        var textColor = Color.White;
-        using var font = new Font("Segoe UI Semibold", 20f, FontStyle.Bold, GraphicsUnit.Pixel);
-        using var textBrush = new SolidBrush(textColor);
+        if (depressed)
+        {
+            using var innerShade = new Pen(Color.FromArgb(88, 0, 0, 0), 3.2f);
+            var inner = RectangleF.Inflate(circle, -5f, -5f);
+            e.Graphics.DrawEllipse(innerShade, inner);
+        }
+        else
+        {
+            using var topHighlight = new Pen(Color.FromArgb(210, 255, 255, 255), 2.2f);
+            var highlight = RectangleF.Inflate(circle, -3f, -3f);
+            e.Graphics.DrawArc(topHighlight, highlight, 208, 118);
+        }
+
+        if (IsSticky)
+        {
+            using var stickyRing = new Pen(Color.FromArgb(170, 255, 255, 255), 1.8f)
+            {
+                DashStyle = DashStyle.Dash
+            };
+            var ring = RectangleF.Inflate(circle, 3f, 3f);
+            e.Graphics.DrawEllipse(stickyRing, ring);
+        }
+
+        if (IsRecording && !IsSticky)
+        {
+            using var recRing = new Pen(Color.FromArgb(130, 255, 255, 255), 1.2f);
+            var ring = RectangleF.Inflate(circle, 2f, 2f);
+            e.Graphics.DrawEllipse(recRing, ring);
+        }
+
+        using var font = new Font("Segoe UI Semibold", 17f, FontStyle.Bold, GraphicsUnit.Pixel);
+        using var textBrush = new SolidBrush(Color.FromArgb(54, 54, 54));
         var format = new StringFormat
         {
             Alignment = StringAlignment.Center,
             LineAlignment = StringAlignment.Center
         };
-        e.Graphics.DrawString(HotkeyText, font, textBrush, circleRect, format);
+        e.Graphics.DrawString(HotkeyText, font, textBrush, circle, format);
     }
 }

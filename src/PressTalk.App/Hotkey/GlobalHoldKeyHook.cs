@@ -7,7 +7,9 @@ public sealed class GlobalHoldKeyHook : IDisposable
 {
     private readonly uint _holdKeyVirtualKey;
     private readonly Action<string>? _log;
+    private readonly object _stateSync = new();
     private NativeMethods.LowLevelKeyboardProc? _callback;
+    private System.Threading.Timer? _stateTimer;
     private IntPtr _hookHandle = IntPtr.Zero;
     private bool _isPressed;
     private bool _stickyChordPressed;
@@ -42,6 +44,7 @@ public sealed class GlobalHoldKeyHook : IDisposable
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to install keyboard hook.");
         }
 
+        _stateTimer = new System.Threading.Timer(_ => ReconcilePhysicalKeyState(), null, 120, 120);
         _log?.Invoke($"[Hotkey.Hook] started, vk=0x{_holdKeyVirtualKey:X}");
     }
 
@@ -85,9 +88,18 @@ public sealed class GlobalHoldKeyHook : IDisposable
 
         if (message == NativeMethods.WM_KEYDOWN || message == NativeMethods.WM_SYSKEYDOWN)
         {
-            if (!_isPressed)
+            var shouldRaise = false;
+            lock (_stateSync)
             {
-                _isPressed = true;
+                if (!_isPressed)
+                {
+                    _isPressed = true;
+                    shouldRaise = true;
+                }
+            }
+
+            if (shouldRaise)
+            {
                 _log?.Invoke($"[Hotkey.Hook] key down, vk=0x{data.vkCode:X}");
                 HoldStarted?.Invoke();
             }
@@ -97,10 +109,19 @@ public sealed class GlobalHoldKeyHook : IDisposable
 
         if (message == NativeMethods.WM_KEYUP || message == NativeMethods.WM_SYSKEYUP)
         {
-            if (_isPressed)
+            var shouldRaise = false;
+            lock (_stateSync)
             {
-                _isPressed = false;
-                _stickyChordPressed = false;
+                if (_isPressed)
+                {
+                    _isPressed = false;
+                    _stickyChordPressed = false;
+                    shouldRaise = true;
+                }
+            }
+
+            if (shouldRaise)
+            {
                 _log?.Invoke($"[Hotkey.Hook] key up, vk=0x{data.vkCode:X}");
                 HoldEnded?.Invoke();
             }
@@ -118,9 +139,40 @@ public sealed class GlobalHoldKeyHook : IDisposable
             return;
         }
 
+        _stateTimer?.Dispose();
+        _stateTimer = null;
         NativeMethods.UnhookWindowsHookEx(_hookHandle);
         _log?.Invoke("[Hotkey.Hook] stopped");
         _hookHandle = IntPtr.Zero;
         _callback = null;
+    }
+
+    private void ReconcilePhysicalKeyState()
+    {
+        var shouldRaise = false;
+
+        lock (_stateSync)
+        {
+            if (!_isPressed)
+            {
+                return;
+            }
+
+            var keyDown = (NativeMethods.GetAsyncKeyState((int)_holdKeyVirtualKey) & 0x8000) != 0;
+            if (!keyDown)
+            {
+                _isPressed = false;
+                _stickyChordPressed = false;
+                shouldRaise = true;
+            }
+        }
+
+        if (!shouldRaise)
+        {
+            return;
+        }
+
+        _log?.Invoke($"[Hotkey.Hook] key up reconciled, vk=0x{_holdKeyVirtualKey:X}");
+        HoldEnded?.Invoke();
     }
 }

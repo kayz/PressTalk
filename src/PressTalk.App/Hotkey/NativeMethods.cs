@@ -6,6 +6,9 @@ namespace PressTalk.App.Hotkey;
 internal static class NativeMethods
 {
     public const int WH_KEYBOARD_LL = 13;
+    public const int HOTKEY_ID_PROBE = 0x5A77;
+    public const int HOTKEY_ALREADY_REGISTERED = 1409;
+    public const uint MOD_NONE = 0x0000;
     public const uint VK_SPACE = 0x20;
 
     public const uint WM_KEYDOWN = 0x0100;
@@ -24,6 +27,12 @@ internal static class NativeMethods
         uint dwThreadId);
 
     [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -37,6 +46,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern IntPtr DispatchMessage([In] ref Msg lpMsg);
+
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);

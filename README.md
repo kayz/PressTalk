@@ -37,6 +37,18 @@ Current prototype limitation:
 
 MVP explicitly does **not** include TSF registration and does **not** require LLM.
 
+## Latest Updates (2026-03-03)
+
+1. App runs in floating UI mode by default (`WinForms`, no console window).
+2. Floating window is transparent with a compact white circular button and hotkey label.
+3. Right-click on floating window opens context menu with `Exit`, and exit requires confirmation.
+4. Hotkey conflict is probed before binding; if occupied by another app, capture is disabled and user is prompted to change key.
+5. Hotkey hook now reconciles physical key state periodically to avoid stuck `recording` when `key up` is lost.
+6. Sticky dictation visual state uses press-depth effect (not color-only distinction).
+7. UI and settings copy were updated to Chinese for local usability.
+8. Runtime preload now runs in background after startup to reduce first-use latency.
+9. Recommended publish output path remains fixed at `dist/PressTalk.App`.
+
 ## Planned Technology Stack
 
 1. Speech engine and settings app: `C# / .NET 8`.
