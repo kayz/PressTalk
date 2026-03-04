@@ -12,6 +12,8 @@ public sealed class SendInputTextCommitter : ITextCommitter
     private const uint KeyeventfKeyup = 0x0002;
 
     private readonly Action<string>? _log;
+    private readonly object _sync = new();
+    private string _lastCommittedText = string.Empty;
 
     public SendInputTextCommitter(Action<string>? log = null)
     {
@@ -20,19 +22,29 @@ public sealed class SendInputTextCommitter : ITextCommitter
 
     public Task CommitAsync(string text, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(text))
+        ResetIncrementalState();
+        return CommitIncrementalAsync(text, isFinal: true, cancellationToken);
+    }
+
+    public Task CommitIncrementalAsync(
+        string confirmedText,
+        bool isFinal,
+        CancellationToken cancellationToken)
+    {
+        var delta = ResolveDeltaAndAdvance(confirmedText, isFinal);
+        if (string.IsNullOrEmpty(delta))
         {
-            _log?.Invoke("[Commit.SendInput] skip empty text");
+            _log?.Invoke("[Commit.SendInput] skip empty incremental delta");
             return Task.CompletedTask;
         }
 
         var foreground = GetForegroundWindow();
-        _log?.Invoke($"[Commit.SendInput] start, chars={text.Length}, foreground={DescribeWindow(foreground)}");
+        _log?.Invoke($"[Commit.SendInput] start incremental commit, deltaChars={delta.Length}, isFinal={isFinal}, foreground={DescribeWindow(foreground)}");
 
         var inputSize = Marshal.SizeOf<Input>();
         uint totalSent = 0;
 
-        foreach (var c in text)
+        foreach (var c in delta)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -80,9 +92,36 @@ public sealed class SendInputTextCommitter : ITextCommitter
             totalSent += sent;
         }
 
-        _log?.Invoke($"[Commit.SendInput] done, totalInputsSent={totalSent}, expected={text.Length * 2}");
+        _log?.Invoke($"[Commit.SendInput] done, totalInputsSent={totalSent}, expected={delta.Length * 2}");
 
         return Task.CompletedTask;
+    }
+
+    public void ResetIncrementalState()
+    {
+        lock (_sync)
+        {
+            _lastCommittedText = string.Empty;
+        }
+    }
+
+    private string ResolveDeltaAndAdvance(string confirmedText, bool isFinal)
+    {
+        var current = confirmedText ?? string.Empty;
+        lock (_sync)
+        {
+            if (!current.StartsWith(_lastCommittedText, StringComparison.Ordinal))
+            {
+                _lastCommittedText = string.Empty;
+            }
+
+            var delta = current.Length > _lastCommittedText.Length
+                ? current[_lastCommittedText.Length..]
+                : string.Empty;
+
+            _lastCommittedText = isFinal ? string.Empty : current;
+            return delta;
+        }
     }
 
     [DllImport("user32.dll", SetLastError = true)]

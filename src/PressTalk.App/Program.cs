@@ -12,8 +12,8 @@ using PressTalk.Audio;
 using PressTalk.Commit;
 using PressTalk.Contracts.Asr;
 using PressTalk.Contracts.Commit;
+using PressTalk.Data;
 using PressTalk.Engine;
-using PressTalk.Normalize;
 
 namespace PressTalk.App;
 
@@ -106,12 +106,10 @@ internal sealed class AppLogger
 
 internal sealed class PressTalkUiHost : IDisposable
 {
-    private const int StickySemanticMinChars = 80;
-
     private readonly string[] _args;
     private readonly UserConfigStore _configStore = new();
     private readonly CancellationTokenSource _shutdownCts = new();
-    private readonly Channel<HoldSignal> _signalChannel = Channel.CreateUnbounded<HoldSignal>(
+    private readonly Channel<ToggleSignal> _signalChannel = Channel.CreateUnbounded<ToggleSignal>(
         new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -123,34 +121,35 @@ internal sealed class PressTalkUiHost : IDisposable
 
     private AppUserConfig? _config;
     private GlobalHoldKeyHook? _hotkeyHook;
-    private QwenRuntimeClient? _runtime;
+    private FunAsrRuntimeClient? _runtime;
     private WasapiAudioCaptureService? _audioCapture;
-    private HoldToTalkController? _controller;
+    private StreamingController? _controller;
     private ForegroundWindowTracker? _windowTracker;
+    private JsonHistoryStore? _historyStore;
     private Task? _workerTask;
 
     private bool _isRecording;
-    private bool _isStickyRecording;
     private bool _isHotkeyPressed;
     private bool _initialized;
     private bool _initializationStarted;
     private bool _hotkeyConflictActive;
 
-    private bool _enableLiveCaption;
-    private bool _enableManualSemanticLlm;
-    private bool _enableStickyDictationSemantic;
+    private string _lastPreviewText = string.Empty;
+    private string _lastConfirmedText = string.Empty;
+    private IReadOnlyList<SpeakerSegment> _lastSpeakerSegments = [];
 
     public PressTalkUiHost(string[] args)
     {
         _args = args;
         Form = new FloatingRecorderForm();
         Form.SetHintText("启动中...");
+        Form.ToggleRequested += (_, _) => OnToggleRequested();
+        Form.SettingsRequested += (_, _) => OpenSettingsDialog();
         Form.FormClosing += (_, _) =>
         {
             SaveWindowPosition();
             ShutdownAsync().GetAwaiter().GetResult();
         };
-        Form.SettingsRequested += (_, _) => OpenSettingsDialog();
     }
 
     public FloatingRecorderForm Form { get; }
@@ -167,6 +166,57 @@ internal sealed class PressTalkUiHost : IDisposable
         _ = InitializeInBackgroundAsync();
     }
 
+    public void Dispose()
+    {
+        ShutdownAsync().GetAwaiter().GetResult();
+        _shutdownCts.Dispose();
+    }
+
+    public async Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        var minimumLogLevel = ResolveLogLevel(_args);
+        _logger = new AppLogger(minimumLogLevel);
+        _log = _logger.AsDelegate(AppLogLevel.Debug);
+
+        _logger.Info($"[App] log level={minimumLogLevel}");
+        _log($"[App] process started, pid={Environment.ProcessId}, cwd='{Environment.CurrentDirectory}'");
+
+        if (_args.Any(a => string.Equals(a, "--reset-hotkey", StringComparison.OrdinalIgnoreCase)))
+        {
+            _configStore.Delete();
+            _logger.Info("[App] hotkey config reset requested");
+        }
+
+        _config = await EnsureConfigAsync(cancellationToken);
+        ApplyFormConfig(_config);
+
+        _log(
+            $"[App] settings loaded, holdKey={_config.HoldKeyName}, hotwords={_config.HotwordConfig.GetNormalizedTerms().Count}, speaker={_config.EnableSpeakerDiarization}, topMost={_config.AlwaysOnTop}");
+
+        ITextCommitter committer = new ClipboardPasteTextCommitter(_log);
+
+        var runtimeOptions = BuildFunAsrRuntimeOptions(_args, _log);
+        _runtime = new FunAsrRuntimeClient(runtimeOptions, _log);
+        await _runtime.EnsureReadyAsync(cancellationToken);
+        await _runtime.PreloadAsync(_config.EnableSpeakerDiarization, cancellationToken);
+
+        var backend = new FunAsrBackend(_runtime, _log);
+        var streamingPipeline = new StreamingPipeline(backend, committer, _log);
+
+        _audioCapture = new WasapiAudioCaptureService(_log);
+        _windowTracker = new ForegroundWindowTracker(_log);
+        _historyStore = new JsonHistoryStore();
+
+        _controller = new StreamingController(_audioCapture, streamingPipeline, log: _log);
+        _controller.ResultUpdated += OnStreamingResult;
+
+        BindHotkey(_config.HoldKeyVirtualKey);
+        _workerTask = RunSessionWorkerAsync(_shutdownCts.Token);
+
+        Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击开始/停止");
+        _logger.Info("[App] Ready");
+    }
+
     private async Task InitializeInBackgroundAsync()
     {
         try
@@ -176,7 +226,7 @@ internal sealed class PressTalkUiHost : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Shutdown.
+            // Shutdown path.
         }
         catch (Exception ex)
         {
@@ -195,95 +245,6 @@ internal sealed class PressTalkUiHost : IDisposable
 
             ShowInitFailureAndClose(ex);
         }
-    }
-
-    private void ShowInitFailureAndClose(Exception ex)
-    {
-        if (Form.IsDisposed)
-        {
-            return;
-        }
-
-        MessageBox.Show(
-            Form,
-            $"PressTalk 启动失败：\n\n{ex.Message}",
-            "PressTalk",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Error);
-        Form.Close();
-    }
-
-    public async Task InitializeAsync(CancellationToken cancellationToken)
-    {
-        var minimumLogLevel = ResolveLogLevel(_args);
-        _logger = new AppLogger(minimumLogLevel);
-        _log = _logger.AsDelegate(AppLogLevel.Debug);
-
-        _logger.Info($"[App] log level={minimumLogLevel}");
-        _log($"[App] process started, pid={Environment.ProcessId}, cwd='{Environment.CurrentDirectory}'");
-
-        if (_args.Any(a => string.Equals(a, "--reset-hotkey", StringComparison.OrdinalIgnoreCase)))
-        {
-            _configStore.Delete();
-            _logger.Info("[App] Hotkey config was reset.");
-        }
-
-        _config = await EnsureConfigAsync(cancellationToken);
-        _enableLiveCaption = _config.EnableLiveCaption || HasFlag("--enable-live-caption");
-        _enableManualSemanticLlm = _config.EnableManualSemanticLlm || HasFlag("--enable-semantic-llm");
-        _enableStickyDictationSemantic = _config.EnableStickyDictationSemantic;
-
-        ApplyFormConfig(_config);
-        _logger.Info("[App] UI mode enabled with floating button");
-        _log(
-            $"[App] settings loaded, holdKey={_config.HoldKeyName}, liveCaption={_enableLiveCaption}, manualSemantic={_enableManualSemanticLlm}, stickySemantic={_enableStickyDictationSemantic}, topMost={_config.AlwaysOnTop}");
-
-        var commitMode = ResolveCommitMode(_args);
-        _log($"[App] commit mode={commitMode}");
-        var committer = CreateCommitter(commitMode, _log);
-
-        var runtimeSemanticEnabled = _enableManualSemanticLlm || _enableStickyDictationSemantic;
-        var runtimeOptions = BuildQwenRuntimeOptions(_args, runtimeSemanticEnabled, _log);
-        _log($"[App] asr mode=qwen, finalModel={runtimeOptions.AsrFinalModel}, previewModel={runtimeOptions.AsrPreviewModel}");
-        _log($"[App] qwen device={runtimeOptions.Device}");
-        _log(
-            $"[App] semantic llm runtime={(runtimeOptions.EnableSemanticLlm ? "on" : "off")}, manual={_enableManualSemanticLlm}, stickyDictation={_enableStickyDictationSemantic}, model={runtimeOptions.LlmModel}");
-
-        _runtime = new QwenRuntimeClient(runtimeOptions, _log);
-        await _runtime.EnsureReadyAsync(cancellationToken);
-
-        var asrBackend = new QwenAsrBackend(_runtime, _log);
-        var textNormalizer = new AdaptiveSemanticNormalizer(
-            new RuleBasedNormalizer(_log),
-            new QwenSemanticNormalizer(_runtime, _log),
-            _log);
-
-        var pipeline = new PressTalkPipeline(
-            asrBackend,
-            textNormalizer,
-            committer,
-            _log);
-
-        _audioCapture = new WasapiAudioCaptureService(_log);
-        _windowTracker = new ForegroundWindowTracker(_log);
-        _controller = new HoldToTalkController(
-            _audioCapture,
-            pipeline,
-            log: _log);
-
-        BindHotkey(_config.HoldKeyVirtualKey);
-        _workerTask = RunSessionWorkerAsync(_shutdownCts.Token);
-        _ = PreloadRuntimeAsync(_enableLiveCaption, runtimeSemanticEnabled);
-        Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
-        _logger.Info("[App] Ready");
-    }
-
-    public void Dispose()
-    {
-        ShutdownAsync().GetAwaiter().GetResult();
-        _shutdownCts.Dispose();
-        _hotkeyHook?.Dispose();
-        _runtime?.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 
     private async Task ShutdownAsync()
@@ -307,7 +268,7 @@ internal sealed class PressTalkUiHost : IDisposable
             }
             catch
             {
-                // Ignore shutdown exceptions.
+                // Ignore worker shutdown failures.
             }
         }
 
@@ -319,11 +280,236 @@ internal sealed class PressTalkUiHost : IDisposable
             }
             catch
             {
-                // Ignore runtime shutdown exceptions.
+                // Ignore runtime shutdown failures.
             }
 
             _runtime = null;
         }
+    }
+
+    private async Task RunSessionWorkerAsync(CancellationToken cancellationToken)
+    {
+        if (_controller is null || _windowTracker is null)
+        {
+            throw new InvalidOperationException("Worker started before initialization.");
+        }
+
+        try
+        {
+            while (await _signalChannel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                while (_signalChannel.Reader.TryRead(out var signal))
+                {
+                    if (signal != ToggleSignal.Toggle)
+                    {
+                        continue;
+                    }
+
+                    _log?.Invoke($"[App.Worker] toggle received, recording={_isRecording}");
+                    if (!_isRecording)
+                    {
+                        try
+                        {
+                            _windowTracker.CaptureAtPress();
+                            var hotwords = _config?.HotwordConfig.GetNormalizedTerms() ?? [];
+                            var enableSpeaker = _config?.EnableSpeakerDiarization ?? false;
+                            var sessionId = await _controller.StartStreamingSessionAsync(
+                                languageHint: "auto",
+                                hotwords: hotwords,
+                                enableSpeakerDiarization: enableSpeaker,
+                                cancellationToken: cancellationToken);
+
+                            _windowTracker.TryActivateCapturedWindow();
+                            _isRecording = true;
+                            _lastPreviewText = string.Empty;
+                            _lastConfirmedText = string.Empty;
+                            _lastSpeakerSegments = [];
+                            Form.SetLivePreview("", "");
+                            Form.SetHintText("录音中");
+                            UpdateButtonVisual();
+                            _log?.Invoke($"[App.Worker] recording started, session={sessionId}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _log?.Invoke($"[App.Worker] recording start failed: {ex.Message}");
+                            _isRecording = false;
+                            Form.SetHintText("启动失败，点击设置");
+                            UpdateButtonVisual();
+                        }
+
+                        continue;
+                    }
+
+                    try
+                    {
+                        _windowTracker.TryActivateCapturedWindow();
+                        await Task.Delay(30, cancellationToken);
+                        var finalResult = await _controller.StopStreamingSessionAsync(cancellationToken);
+                        _isRecording = false;
+                        _isHotkeyPressed = false;
+                        UpdateButtonVisual();
+                        Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击开始/停止");
+                        Form.SetLivePreview(
+                            finalResult.PreviewText,
+                            finalResult.ConfirmedText,
+                            finalResult.SpeakerSegments);
+                        await SaveHistoryAsync(finalResult, cancellationToken);
+                        _log?.Invoke(
+                            $"[App.Worker] recording stopped, session={finalResult.SessionId}, textLen={finalResult.ConfirmedText.Length}, speakers={finalResult.SpeakerSegments.Count}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.Invoke($"[App.Worker] recording stop failed: {ex.Message}");
+                        _isRecording = false;
+                        _isHotkeyPressed = false;
+                        UpdateButtonVisual();
+                        Form.SetHintText("停止失败，点击设置");
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _log?.Invoke("[App.Worker] canceled");
+        }
+        finally
+        {
+            _isRecording = false;
+            _isHotkeyPressed = false;
+            UpdateButtonVisual();
+        }
+    }
+
+    private void OnStreamingResult(StreamingAsrResult result)
+    {
+        if (!string.IsNullOrWhiteSpace(result.PreviewText))
+        {
+            _lastPreviewText = result.PreviewText;
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.ConfirmedText))
+        {
+            _lastConfirmedText = result.ConfirmedText;
+        }
+
+        if (result.SpeakerSegments.Count > 0)
+        {
+            _lastSpeakerSegments = result.SpeakerSegments;
+        }
+
+        var segments = _lastSpeakerSegments.Count > 0 ? _lastSpeakerSegments : null;
+        Form.SetLivePreview(_lastPreviewText, _lastConfirmedText, segments);
+    }
+
+    private async Task SaveHistoryAsync(StreamingAsrResult result, CancellationToken cancellationToken)
+    {
+        if (_historyStore is null)
+        {
+            return;
+        }
+
+        var text = result.ConfirmedText.Trim();
+        if (text.Length == 0)
+        {
+            return;
+        }
+
+        var record = new HistoryRecord(
+            SessionId: result.SessionId,
+            Timestamp: DateTimeOffset.Now,
+            RawText: text,
+            NormalizedText: text,
+            AppName: "PressTalk.Streaming");
+
+        await _historyStore.AppendAsync(record, cancellationToken);
+    }
+
+    private void BindHotkey(uint virtualKey)
+    {
+        _hotkeyHook?.Dispose();
+        _hotkeyHook = null;
+        _hotkeyConflictActive = false;
+
+        if (IsGlobalHotkeyOccupied(virtualKey))
+        {
+            _hotkeyConflictActive = true;
+            _log?.Invoke($"[Hotkey.Hook] bind blocked by conflict, vk=0x{virtualKey:X}");
+            Form.SetHintText("热键冲突，请改键");
+            ShowWarning($"热键 {HoldKeyPresetCatalog.Resolve(virtualKey).DisplayName} 被其他程序占用，请到设置中更换。");
+            UpdateButtonVisual();
+            return;
+        }
+
+        _hotkeyHook = new GlobalHoldKeyHook(virtualKey, _log);
+        _hotkeyHook.HoldStarted += OnHotkeyStarted;
+        _hotkeyHook.HoldEnded += OnHotkeyEnded;
+        _hotkeyHook.StickyModeToggleRequested += OnToggleRequested;
+        _hotkeyHook.Start();
+    }
+
+    private void OnHotkeyStarted()
+    {
+        if (!_initialized || _hotkeyConflictActive)
+        {
+            return;
+        }
+
+        _isHotkeyPressed = true;
+        UpdateButtonVisual();
+        var ok = _signalChannel.Writer.TryWrite(ToggleSignal.Toggle);
+        _log?.Invoke($"[App] enqueue toggle from hotkey, ok={ok}");
+    }
+
+    private void OnHotkeyEnded()
+    {
+        _isHotkeyPressed = false;
+        UpdateButtonVisual();
+    }
+
+    private void OnToggleRequested()
+    {
+        if (!_initialized || _hotkeyConflictActive)
+        {
+            return;
+        }
+
+        var ok = _signalChannel.Writer.TryWrite(ToggleSignal.Toggle);
+        _log?.Invoke($"[App] enqueue toggle from UI/hook, ok={ok}");
+    }
+
+    private void UpdateButtonVisual()
+    {
+        Form.SetVisualState(
+            isPressed: _isHotkeyPressed,
+            isRecording: _isRecording,
+            isSticky: false);
+    }
+
+    private async Task<AppUserConfig> EnsureConfigAsync(CancellationToken cancellationToken)
+    {
+        var config = await _configStore.LoadAsync(cancellationToken);
+        if (config is not null && HoldKeyPresetCatalog.IsSupported(config.HoldKeyVirtualKey))
+        {
+            config.HotwordConfig ??= new HotwordConfig();
+            return config;
+        }
+
+        var preset = HoldKeyPresetCatalog.Default;
+        var selected = new AppUserConfig
+        {
+            SchemaVersion = 2,
+            HoldKeyName = preset.DisplayName,
+            HoldKeyVirtualKey = preset.VirtualKey,
+            EnableLiveCaption = true,
+            EnableManualSemanticLlm = false,
+            EnableStickyDictationSemantic = false,
+            EnableSpeakerDiarization = false,
+            HotwordConfig = new HotwordConfig(),
+            AlwaysOnTop = true
+        };
+
+        await _configStore.SaveAsync(selected, cancellationToken);
+        return selected;
     }
 
     private void OpenSettingsDialog()
@@ -365,13 +551,9 @@ internal sealed class PressTalkUiHost : IDisposable
         updated.FloatingWindowY = Form.Top;
         _config = updated;
 
-        _enableLiveCaption = updated.EnableLiveCaption;
-        _enableManualSemanticLlm = updated.EnableManualSemanticLlm;
-        _enableStickyDictationSemantic = updated.EnableStickyDictationSemantic;
-
         ApplyFormConfig(updated);
         _log?.Invoke(
-            $"[App] settings updated, holdKey={updated.HoldKeyName}, liveCaption={_enableLiveCaption}, manualSemantic={_enableManualSemanticLlm}, stickySemantic={_enableStickyDictationSemantic}, topMost={updated.AlwaysOnTop}");
+            $"[App] settings updated, holdKey={updated.HoldKeyName}, hotwords={updated.HotwordConfig.GetNormalizedTerms().Count}, speaker={updated.EnableSpeakerDiarization}, topMost={updated.AlwaysOnTop}");
 
         BindHotkey(updated.HoldKeyVirtualKey);
         _configStore.SaveAsync(updated, CancellationToken.None).GetAwaiter().GetResult();
@@ -381,9 +563,7 @@ internal sealed class PressTalkUiHost : IDisposable
     {
         Form.SetHotkeyText(HoldKeyPresetCatalog.Resolve(config.HoldKeyVirtualKey).DisplayName);
         Form.SetTopMost(config.AlwaysOnTop);
-
-        var start = ResolveWindowLocation(config);
-        Form.Location = start;
+        Form.Location = ResolveWindowLocation(config);
     }
 
     private Point ResolveWindowLocation(AppUserConfig config)
@@ -422,387 +602,20 @@ internal sealed class PressTalkUiHost : IDisposable
         _configStore.SaveAsync(_config, CancellationToken.None).GetAwaiter().GetResult();
     }
 
-    private void BindHotkey(uint virtualKey)
+    private void ShowInitFailureAndClose(Exception ex)
     {
-        _hotkeyHook?.Dispose();
-        _hotkeyHook = null;
-        _hotkeyConflictActive = false;
-
-        if (IsGlobalHotkeyOccupied(virtualKey))
+        if (Form.IsDisposed)
         {
-            _hotkeyConflictActive = true;
-            _log?.Invoke($"[Hotkey.Hook] bind blocked by conflict, vk=0x{virtualKey:X}");
-            Form.SetHintText("热键冲突，请改键");
-            ShowWarning(
-                $"热键 {HoldKeyPresetCatalog.Resolve(virtualKey).DisplayName} 被其他程序占用，请到设置中更换。");
-            UpdateButtonVisual();
             return;
         }
 
-        _hotkeyHook = new GlobalHoldKeyHook(virtualKey, _log);
-        _hotkeyHook.HoldStarted += OnHotkeyStarted;
-        _hotkeyHook.HoldEnded += OnHotkeyEnded;
-        _hotkeyHook.StickyModeToggleRequested += OnStickyToggleRequested;
-        _hotkeyHook.Start();
-    }
-
-    private void OnHotkeyStarted()
-    {
-        if (!_initialized)
-        {
-            _log?.Invoke("[App] hotkey start ignored: initialization not completed");
-            return;
-        }
-
-        if (_hotkeyConflictActive)
-        {
-            _log?.Invoke("[App] hotkey start ignored: hotkey conflict active");
-            return;
-        }
-
-        _isHotkeyPressed = true;
-        UpdateButtonVisual();
-        var ok = _signalChannel.Writer.TryWrite(HoldSignal.Start);
-        _log?.Invoke($"[App] enqueue signal Start, ok={ok}");
-    }
-
-    private void OnHotkeyEnded()
-    {
-        if (!_initialized)
-        {
-            _log?.Invoke("[App] hotkey end ignored: initialization not completed");
-            return;
-        }
-
-        if (_hotkeyConflictActive)
-        {
-            _log?.Invoke("[App] hotkey end ignored: hotkey conflict active");
-            return;
-        }
-
-        _isHotkeyPressed = false;
-        UpdateButtonVisual();
-        var ok = _signalChannel.Writer.TryWrite(HoldSignal.End);
-        _log?.Invoke($"[App] enqueue signal End, ok={ok}");
-    }
-
-    private void OnStickyToggleRequested()
-    {
-        if (!_initialized)
-        {
-            _log?.Invoke("[App] sticky toggle ignored: initialization not completed");
-            return;
-        }
-
-        if (_hotkeyConflictActive)
-        {
-            _log?.Invoke("[App] sticky toggle ignored: hotkey conflict active");
-            return;
-        }
-
-        var ok = _signalChannel.Writer.TryWrite(HoldSignal.StickyModeToggle);
-        _log?.Invoke($"[App] enqueue signal StickyModeToggle, ok={ok}");
-    }
-
-    private void UpdateButtonVisual()
-    {
-        Form.SetVisualState(
-            isPressed: _isHotkeyPressed,
-            isRecording: _isRecording,
-            isSticky: _isStickyRecording);
-    }
-
-    private async Task RunSessionWorkerAsync(CancellationToken cancellationToken)
-    {
-        if (_controller is null || _windowTracker is null || _audioCapture is null || _runtime is null)
-        {
-            throw new InvalidOperationException("Worker started before initialization.");
-        }
-
-        Task? liveCaptionTask = null;
-        CancellationTokenSource? liveCaptionCts = null;
-        var stickyMode = false;
-
-        async Task StopAndCommitAsync()
-        {
-            if (liveCaptionCts is not null)
-            {
-                liveCaptionCts.Cancel();
-            }
-
-            if (liveCaptionTask is not null)
-            {
-                var completed = await Task.WhenAny(
-                    liveCaptionTask,
-                    Task.Delay(150, cancellationToken));
-
-                if (completed != liveCaptionTask)
-                {
-                    _log?.Invoke("[App.Live] caption loop did not stop within 150ms; proceeding with commit");
-                }
-            }
-
-            var activated = _windowTracker.TryActivateCapturedWindow();
-            _log?.Invoke($"[App.Worker] target activation result={activated}");
-            await Task.Delay(30, cancellationToken);
-
-            var semanticEnabledForSession =
-                _enableManualSemanticLlm
-                || (_enableStickyDictationSemantic && stickyMode);
-
-            var result = await _controller.OnReleaseAsync(
-                cancellationToken,
-                isStickyDictationMode: stickyMode,
-                enableSemanticEnhancement: semanticEnabledForSession);
-
-            var semanticCandidateChars = result.RawText.Trim().Length;
-            var semanticExpected = semanticEnabledForSession && semanticCandidateChars >= StickySemanticMinChars;
-            _log?.Invoke(
-                $"[App.Worker] commit completed, session={result.SessionId}, stickyDictation={stickyMode}, semanticEnabled={semanticEnabledForSession}, semanticCandidateChars={semanticCandidateChars}, semanticExpected={semanticExpected}");
-        }
-
-        try
-        {
-            while (await _signalChannel.Reader.WaitToReadAsync(cancellationToken))
-            {
-                while (_signalChannel.Reader.TryRead(out var signal))
-                {
-                    _log?.Invoke($"[App.Worker] dequeued signal={signal}, isRecording={_isRecording}, sticky={stickyMode}");
-
-                    if (signal == HoldSignal.StickyModeToggle && _isRecording && !stickyMode)
-                    {
-                        stickyMode = true;
-                        _isStickyRecording = true;
-                        UpdateButtonVisual();
-                        Form.SetHintText("长文模式，按热键结束");
-                        _log?.Invoke("[App.Worker] sticky dictation enabled");
-                        continue;
-                    }
-
-                    if (signal == HoldSignal.Start && !_isRecording)
-                    {
-                        try
-                        {
-                            _windowTracker.CaptureAtPress();
-                            var sessionId = await _controller.OnPressAsync("auto", cancellationToken);
-                            _isRecording = true;
-                            stickyMode = false;
-                            _isStickyRecording = false;
-                            Form.SetHintText("正在录音...");
-                            UpdateButtonVisual();
-                            _log?.Invoke($"[App.Worker] recording started, session={sessionId}");
-
-                            if (_enableLiveCaption)
-                            {
-                                liveCaptionCts = new CancellationTokenSource();
-                                liveCaptionTask = RunLiveCaptionLoopAsync(
-                                    sessionId,
-                                    _audioCapture,
-                                    _runtime,
-                                    liveCaptionCts.Token,
-                                    _log!);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _log?.Invoke($"[App.Worker] start failed: {ex}");
-                            _isRecording = false;
-                            stickyMode = false;
-                            _isStickyRecording = false;
-                            UpdateButtonVisual();
-                            Form.SetHintText("启动失败，点击设置");
-                        }
-
-                        continue;
-                    }
-
-                    if (signal == HoldSignal.Start && _isRecording && stickyMode)
-                    {
-                        try
-                        {
-                            _log?.Invoke("[App.Worker] sticky stop requested by hotkey press");
-                            await StopAndCommitAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            _log?.Invoke($"[App.Worker] commit failed: {ex}");
-                        }
-                        finally
-                        {
-                            liveCaptionTask = null;
-                            liveCaptionCts?.Dispose();
-                            liveCaptionCts = null;
-                            _isRecording = false;
-                            stickyMode = false;
-                            _isStickyRecording = false;
-                            _isHotkeyPressed = false;
-                            Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
-                            UpdateButtonVisual();
-                        }
-
-                        continue;
-                    }
-
-                    if (signal == HoldSignal.End && _isRecording)
-                    {
-                        if (stickyMode)
-                        {
-                            _log?.Invoke("[App.Worker] hold-key release ignored because sticky dictation is active");
-                            continue;
-                        }
-
-                        try
-                        {
-                            await StopAndCommitAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            _log?.Invoke($"[App.Worker] commit failed: {ex}");
-                        }
-                        finally
-                        {
-                            liveCaptionTask = null;
-                            liveCaptionCts?.Dispose();
-                            liveCaptionCts = null;
-                            _isRecording = false;
-                            stickyMode = false;
-                            _isStickyRecording = false;
-                            _isHotkeyPressed = false;
-                            Form.SetHintText(_hotkeyConflictActive ? "热键冲突，请改键" : "点击按钮设置");
-                            UpdateButtonVisual();
-                        }
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            _log?.Invoke("[App.Worker] canceled");
-        }
-        finally
-        {
-            if (liveCaptionCts is not null)
-            {
-                liveCaptionCts.Cancel();
-                liveCaptionCts.Dispose();
-            }
-
-            if (liveCaptionTask is not null)
-            {
-                try
-                {
-                    await Task.WhenAny(liveCaptionTask, Task.Delay(200));
-                }
-                catch
-                {
-                    // Ignore preview errors during shutdown.
-                }
-            }
-
-            _audioCapture.ForceStop();
-            _isRecording = false;
-            _isStickyRecording = false;
-            _isHotkeyPressed = false;
-            UpdateButtonVisual();
-        }
-    }
-
-    private static async Task RunLiveCaptionLoopAsync(
-        string sessionId,
-        WasapiAudioCaptureService audioCapture,
-        QwenRuntimeClient runtime,
-        CancellationToken cancellationToken,
-        Action<string> log)
-    {
-        var lastPreview = string.Empty;
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await Task.Delay(450, cancellationToken);
-
-                if (runtime.IsBusy)
-                {
-                    continue;
-                }
-
-                if (!audioCapture.TryGetLiveSnapshot(TimeSpan.FromSeconds(0.8), out var snapshot))
-                {
-                    continue;
-                }
-
-                if (snapshot.AudioSamples.Length < snapshot.SampleRate / 4)
-                {
-                    continue;
-                }
-
-                var preview = await runtime.TranscribePreviewAsync(
-                    snapshot.AudioSamples,
-                    snapshot.SampleRate,
-                    "auto",
-                    CancellationToken.None);
-
-                var text = preview.Text.Trim();
-                if (text.Length == 0 || string.Equals(text, lastPreview, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                lastPreview = text;
-                log($"[App.Live] preview updated, session={sessionId}, textLen={text.Length}, durationMs={preview.Duration.TotalMilliseconds:F1}");
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                log($"[App.Live] preview stopped: {ex.Message}");
-                return;
-            }
-        }
-    }
-
-    private async Task<AppUserConfig> EnsureConfigAsync(CancellationToken cancellationToken)
-    {
-        var config = await _configStore.LoadAsync(cancellationToken);
-
-        if (config is not null && HoldKeyPresetCatalog.IsSupported(config.HoldKeyVirtualKey))
-        {
-            return config;
-        }
-
-        var preset = HoldKeyPresetCatalog.Default;
-        var selected = new AppUserConfig
-        {
-            SchemaVersion = 1,
-            HoldKeyName = preset.DisplayName,
-            HoldKeyVirtualKey = preset.VirtualKey,
-            EnableLiveCaption = false,
-            EnableManualSemanticLlm = false,
-            EnableStickyDictationSemantic = true,
-            AlwaysOnTop = true
-        };
-
-        await _configStore.SaveAsync(selected, cancellationToken);
-        return selected;
-    }
-
-    private static AppUserConfig CloneConfig(AppUserConfig source)
-    {
-        return new AppUserConfig
-        {
-            SchemaVersion = source.SchemaVersion,
-            HoldKeyName = source.HoldKeyName,
-            HoldKeyVirtualKey = source.HoldKeyVirtualKey,
-            EnableLiveCaption = source.EnableLiveCaption,
-            EnableManualSemanticLlm = source.EnableManualSemanticLlm,
-            EnableStickyDictationSemantic = source.EnableStickyDictationSemantic,
-            AlwaysOnTop = source.AlwaysOnTop,
-            FloatingWindowX = source.FloatingWindowX,
-            FloatingWindowY = source.FloatingWindowY
-        };
+        MessageBox.Show(
+            Form,
+            $"PressTalk 启动失败：\n\n{ex.Message}",
+            "PressTalk",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error);
+        Form.Close();
     }
 
     private bool HasFlag(string flag)
@@ -810,75 +623,43 @@ internal sealed class PressTalkUiHost : IDisposable
         return _args.Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string ResolveCommitMode(string[] args)
+    private static FunAsrRuntimeOptions BuildFunAsrRuntimeOptions(string[] args, Action<string> log)
     {
-        const string prefix = "--commit-mode=";
-        var arg = args.FirstOrDefault(a => a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-        if (arg is null)
-        {
-            return "paste";
-        }
+        var scriptOverride = ResolveOption(args, "--funasr-script=");
+        var pythonOverride = ResolveOption(args, "--funasr-python=");
+        var modelOverride = ResolveOption(args, "--funasr-model=");
+        var speakerModelOverride = ResolveOption(args, "--funasr-speaker-model=");
+        var deviceOverride = ResolveOption(args, "--funasr-device=");
+        var int8Override = ResolveOption(args, "--funasr-int8=");
 
-        var mode = arg[prefix.Length..].Trim().ToLowerInvariant();
-        return mode is "sendinput" or "paste" ? mode : "paste";
-    }
-
-    private static ITextCommitter CreateCommitter(string mode, Action<string> log)
-    {
-        return mode switch
-        {
-            "sendinput" => new SendInputTextCommitter(log),
-            _ => new ClipboardPasteTextCommitter(log)
-        };
-    }
-
-    private static QwenRuntimeOptions BuildQwenRuntimeOptions(string[] args, bool enableSemanticLlm, Action<string> log)
-    {
-        var scriptOverride = ResolveOption(args, "--qwen-script=");
-        var pythonOverride = ResolveOption(args, "--qwen-python=");
-        var finalModelOverride = ResolveOption(args, "--qwen-asr-final=");
-        var previewModelOverride = ResolveOption(args, "--qwen-asr-preview=");
-        var llmModelOverride = ResolveOption(args, "--qwen-llm=");
-        var deviceOverride = ResolveOption(args, "--qwen-device=");
-        var envDevice = Environment.GetEnvironmentVariable("PRESSTALK_QWEN_DEVICE");
         var pythonExecutable = pythonOverride
-            ?? Environment.GetEnvironmentVariable("PRESSTALK_QWEN_PYTHON")
+            ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_PYTHON")
             ?? "python";
-        var configuredDevice = deviceOverride ?? envDevice;
+        var configuredDevice = deviceOverride
+            ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_DEVICE");
         var resolvedDevice = string.IsNullOrWhiteSpace(configuredDevice) || string.Equals(configuredDevice, "auto", StringComparison.OrdinalIgnoreCase)
             ? DetectPreferredDevice(pythonExecutable, log)
             : configuredDevice!;
 
-        if (!string.IsNullOrWhiteSpace(deviceOverride))
-        {
-            log($"[App] device override from arg={resolvedDevice}");
-        }
-        else if (!string.IsNullOrWhiteSpace(envDevice))
-        {
-            log($"[App] device override from env={resolvedDevice}");
-        }
+        var int8ValueRaw = int8Override
+            ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_INT8")
+            ?? "0";
+        var enableInt8 = int8ValueRaw is "1" or "true" or "True" or "TRUE";
 
-        var defaultFinalModel = "Qwen/Qwen3-ASR-0.6B";
-        var configuredFinalModel = finalModelOverride
-            ?? Environment.GetEnvironmentVariable("PRESSTALK_QWEN_ASR_FINAL")
-            ?? defaultFinalModel;
-        var configuredPreviewModel = previewModelOverride
-            ?? Environment.GetEnvironmentVariable("PRESSTALK_QWEN_ASR_PREVIEW")
-            ?? configuredFinalModel;
-
-        return new QwenRuntimeOptions
+        return new FunAsrRuntimeOptions
         {
             ScriptPath = scriptOverride
-                ?? Environment.GetEnvironmentVariable("PRESSTALK_QWEN_SCRIPT")
-                ?? Path.Combine(AppContext.BaseDirectory, "qwen_runtime.py"),
+                ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_SCRIPT")
+                ?? Path.Combine(AppContext.BaseDirectory, "funasr_runtime.py"),
             PythonExecutable = pythonExecutable,
-            AsrFinalModel = configuredFinalModel,
-            AsrPreviewModel = configuredPreviewModel,
-            LlmModel = llmModelOverride
-                ?? Environment.GetEnvironmentVariable("PRESSTALK_QWEN_LLM")
-                ?? "Qwen/Qwen3-0.6B",
+            StreamingModel = modelOverride
+                ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_MODEL")
+                ?? "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+            SpeakerModel = speakerModelOverride
+                ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_SPK_MODEL")
+                ?? "iic/speech_campplus_sv_zh-cn_16k-common",
             Device = resolvedDevice,
-            EnableSemanticLlm = enableSemanticLlm,
+            EnableInt8Quantization = enableInt8,
             CommandTimeoutMs = 180000
         };
     }
@@ -1015,28 +796,25 @@ internal sealed class PressTalkUiHost : IDisposable
         return false;
     }
 
-    private async Task PreloadRuntimeAsync(bool includePreview, bool includeSemantic)
+    private static AppUserConfig CloneConfig(AppUserConfig source)
     {
-        if (_runtime is null)
+        return new AppUserConfig
         {
-            return;
-        }
-
-        try
-        {
-            await Task.Delay(1200, CancellationToken.None);
-            if (_isRecording)
+            SchemaVersion = source.SchemaVersion,
+            HoldKeyName = source.HoldKeyName,
+            HoldKeyVirtualKey = source.HoldKeyVirtualKey,
+            EnableLiveCaption = source.EnableLiveCaption,
+            EnableManualSemanticLlm = source.EnableManualSemanticLlm,
+            EnableStickyDictationSemantic = source.EnableStickyDictationSemantic,
+            EnableSpeakerDiarization = source.EnableSpeakerDiarization,
+            HotwordConfig = new HotwordConfig
             {
-                _log?.Invoke("[App] runtime preload skipped: recording already active");
-                return;
-            }
-
-            await _runtime.PreloadAsync(includePreview, includeSemantic, CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            _log?.Invoke($"[App] runtime preload skipped: {ex.Message}");
-        }
+                Terms = source.HotwordConfig.GetNormalizedTerms().ToList()
+            },
+            AlwaysOnTop = source.AlwaysOnTop,
+            FloatingWindowX = source.FloatingWindowX,
+            FloatingWindowY = source.FloatingWindowY
+        };
     }
 
     private void ShowWarning(string message)

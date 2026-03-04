@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using PressTalk.Contracts.Asr;
 
 namespace PressTalk.App.Ui;
 
@@ -7,17 +8,22 @@ public sealed class FloatingRecorderForm : Form
 {
     private readonly CircleHotkeyButton _button;
     private readonly Label _hintLabel;
+    private readonly RichTextBox _previewBox;
     private readonly ContextMenuStrip _contextMenu;
+    private readonly System.Windows.Forms.Timer _waveTimer;
     private bool _dragging;
     private Point _dragOrigin;
+    private bool _isRecording;
+    private int _waveFrame;
+    private string _baseHintText = "点击按钮设置";
 
     public FloatingRecorderForm()
     {
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.Manual;
-        Width = 106;
-        Height = 126;
+        Width = 360;
+        Height = 260;
         TopMost = true;
         DoubleBuffered = true;
         BackColor = Color.Magenta;
@@ -27,27 +33,48 @@ public sealed class FloatingRecorderForm : Form
         {
             Width = 86,
             Height = 86,
-            Left = (Width - 86) / 2,
-            Top = 6
+            Left = 12,
+            Top = 12
         };
-        _button.Click += (_, _) => SettingsRequested?.Invoke(this, EventArgs.Empty);
+        _button.Click += (_, _) => ToggleRequested?.Invoke(this, EventArgs.Empty);
         Controls.Add(_button);
 
         _hintLabel = new Label
         {
             AutoSize = false,
-            Width = Width,
-            Height = 26,
-            Left = 0,
-            Top = 96,
-            TextAlign = ContentAlignment.MiddleCenter,
+            Width = Width - 120,
+            Height = 44,
+            Left = 104,
+            Top = 20,
+            TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.White,
             BackColor = Color.Transparent,
-            Text = "点击按钮设置"
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Regular, GraphicsUnit.Point),
+            Text = _baseHintText
         };
         Controls.Add(_hintLabel);
 
+        _previewBox = new RichTextBox
+        {
+            Left = 12,
+            Top = 108,
+            Width = Width - 24,
+            Height = Height - 120,
+            ReadOnly = true,
+            BorderStyle = BorderStyle.None,
+            BackColor = Color.FromArgb(22, 22, 22),
+            ForeColor = Color.FromArgb(232, 232, 232),
+            Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Regular, GraphicsUnit.Point),
+            ScrollBars = RichTextBoxScrollBars.Vertical,
+            Text = "实时转写会显示在这里..."
+        };
+        Controls.Add(_previewBox);
+
         _contextMenu = new ContextMenuStrip();
+        var settingsItem = new ToolStripMenuItem("设置");
+        settingsItem.Click += (_, _) => SettingsRequested?.Invoke(this, EventArgs.Empty);
+        _contextMenu.Items.Add(settingsItem);
+
         var exitItem = new ToolStripMenuItem("退出");
         exitItem.Click += (_, _) =>
         {
@@ -64,14 +91,23 @@ public sealed class FloatingRecorderForm : Form
         };
         _contextMenu.Items.Add(exitItem);
 
+        _waveTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 150
+        };
+        _waveTimer.Tick += (_, _) => RefreshWaveHint();
+
         BindRightClick(this);
         BindRightClick(_button);
         BindRightClick(_hintLabel);
+        BindRightClick(_previewBox);
         BindDrag(this);
         BindDrag(_button);
         BindDrag(_hintLabel);
+        BindDrag(_previewBox);
     }
 
+    public event EventHandler? ToggleRequested;
     public event EventHandler? SettingsRequested;
 
     public void SetTopMost(bool topMost)
@@ -109,6 +145,25 @@ public sealed class FloatingRecorderForm : Form
         _button.IsRecording = isRecording;
         _button.IsSticky = isSticky;
         _button.Invalidate();
+
+        _isRecording = isRecording;
+        if (_isRecording)
+        {
+            if (!_waveTimer.Enabled)
+            {
+                _waveFrame = 0;
+                _waveTimer.Start();
+            }
+        }
+        else
+        {
+            if (_waveTimer.Enabled)
+            {
+                _waveTimer.Stop();
+            }
+
+            _hintLabel.Text = _baseHintText;
+        }
     }
 
     public void SetHintText(string text)
@@ -119,7 +174,73 @@ public sealed class FloatingRecorderForm : Form
             return;
         }
 
-        _hintLabel.Text = text;
+        _baseHintText = text;
+        if (!_isRecording)
+        {
+            _hintLabel.Text = text;
+        }
+    }
+
+    public void SetLivePreview(
+        string previewText,
+        string confirmedText,
+        IReadOnlyList<SpeakerSegment>? speakerSegments = null)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new MethodInvoker(() => SetLivePreview(previewText, confirmedText, speakerSegments)));
+            return;
+        }
+
+        var preferred = string.IsNullOrWhiteSpace(confirmedText) ? previewText : confirmedText;
+        if (speakerSegments is not null && speakerSegments.Count > 0)
+        {
+            RenderSpeakerSegments(speakerSegments);
+            return;
+        }
+
+        _previewBox.Clear();
+        _previewBox.SelectionColor = Color.FromArgb(232, 232, 232);
+        _previewBox.AppendText(string.IsNullOrWhiteSpace(preferred) ? "实时转写会显示在这里..." : preferred);
+    }
+
+    private void RenderSpeakerSegments(IReadOnlyList<SpeakerSegment> segments)
+    {
+        var palette = new[]
+        {
+            Color.FromArgb(126, 224, 255),
+            Color.FromArgb(178, 241, 173),
+            Color.FromArgb(255, 201, 123),
+            Color.FromArgb(255, 152, 168),
+            Color.FromArgb(216, 184, 255)
+        };
+
+        _previewBox.Clear();
+        for (var i = 0; i < segments.Count; i++)
+        {
+            var segment = segments[i];
+            var color = palette[i % palette.Length];
+            _previewBox.SelectionColor = color;
+            _previewBox.AppendText($"[{segment.SpeakerId}] ");
+            _previewBox.SelectionColor = Color.FromArgb(232, 232, 232);
+            _previewBox.AppendText(segment.Text);
+            if (i < segments.Count - 1)
+            {
+                _previewBox.AppendText(Environment.NewLine);
+            }
+        }
+    }
+
+    private void RefreshWaveHint()
+    {
+        if (!_isRecording)
+        {
+            return;
+        }
+
+        var frames = new[] { "▁▂▃▂", "▂▃▄▃", "▃▄▅▄", "▄▅▆▅" };
+        _hintLabel.Text = $"{_baseHintText}  {frames[_waveFrame % frames.Length]}";
+        _waveFrame++;
     }
 
     private void BindDrag(Control control)
@@ -195,6 +316,12 @@ internal sealed class CircleHotkeyButton : Control
         base.OnPaint(e);
 
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var chrome = new LinearGradientBrush(
+            ClientRectangle,
+            Color.FromArgb(40, 40, 40),
+            Color.FromArgb(18, 18, 18),
+            LinearGradientMode.Vertical);
+        e.Graphics.FillRectangle(chrome, ClientRectangle);
 
         var bounds = ClientRectangle;
         var baseCircle = new RectangleF(4, 4, bounds.Width - 8, bounds.Height - 8);

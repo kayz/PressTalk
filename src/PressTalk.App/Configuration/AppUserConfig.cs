@@ -14,6 +14,10 @@ public sealed class AppUserConfig
 
     public bool EnableStickyDictationSemantic { get; set; } = true;
 
+    public bool EnableSpeakerDiarization { get; set; }
+
+    public HotwordConfig HotwordConfig { get; set; } = new();
+
     public bool AlwaysOnTop { get; set; } = true;
 
     public int? FloatingWindowX { get; set; }

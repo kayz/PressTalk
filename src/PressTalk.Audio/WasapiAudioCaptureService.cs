@@ -207,6 +207,45 @@ public sealed class WasapiAudioCaptureService : IAudioCaptureService
         }
     }
 
+    public bool TryGetIncrementalChunk(
+        int fromSampleIndex,
+        int minimumSamples,
+        out AudioCaptureResult chunk,
+        out int totalSamples)
+    {
+        lock (_sync)
+        {
+            if (_activeSessionId is null || _buffer is null || _waveFormat is null)
+            {
+                chunk = new AudioCaptureResult(ReadOnlyMemory<float>.Empty, 0, TimeSpan.Zero);
+                totalSamples = 0;
+                return false;
+            }
+
+            var format = _waveFormat;
+            var bytes = _buffer;
+            var frameCount = bytes.Count / format.BlockAlign;
+            totalSamples = frameCount;
+
+            var startFrame = Math.Clamp(fromSampleIndex, 0, frameCount);
+            var availableFrames = frameCount - startFrame;
+            if (availableFrames < Math.Max(1, minimumSamples))
+            {
+                chunk = new AudioCaptureResult(ReadOnlyMemory<float>.Empty, format.SampleRate, DateTimeOffset.UtcNow - _startedAt);
+                return false;
+            }
+
+            var startOffset = startFrame * format.BlockAlign;
+            var length = availableFrames * format.BlockAlign;
+            var buffer = new byte[length];
+            bytes.CopyTo(startOffset, buffer, 0, length);
+
+            var samples = ConvertToMonoFloatSamples(buffer, format, _gainFactor, out _);
+            chunk = new AudioCaptureResult(samples, format.SampleRate, DateTimeOffset.UtcNow - _startedAt);
+            return samples.Length > 0;
+        }
+    }
+
     private void CaptureOnDataAvailable(object? sender, WaveInEventArgs e)
     {
         lock (_sync)

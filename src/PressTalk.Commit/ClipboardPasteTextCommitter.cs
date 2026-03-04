@@ -15,6 +15,8 @@ public sealed class ClipboardPasteTextCommitter : ITextCommitter
     private const uint KeyeventfKeyup = 0x0002;
 
     private readonly Action<string>? _log;
+    private readonly object _sync = new();
+    private string _lastCommittedText = string.Empty;
 
     public ClipboardPasteTextCommitter(Action<string>? log = null)
     {
@@ -23,22 +25,59 @@ public sealed class ClipboardPasteTextCommitter : ITextCommitter
 
     public Task CommitAsync(string text, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(text))
+        ResetIncrementalState();
+        return CommitIncrementalAsync(text, isFinal: true, cancellationToken);
+    }
+
+    public Task CommitIncrementalAsync(
+        string confirmedText,
+        bool isFinal,
+        CancellationToken cancellationToken)
+    {
+        var delta = ResolveDeltaAndAdvance(confirmedText, isFinal);
+        if (string.IsNullOrEmpty(delta))
         {
-            _log?.Invoke("[Commit.Clipboard] skip empty text");
+            _log?.Invoke("[Commit.Clipboard] skip empty incremental delta");
             return Task.CompletedTask;
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        _log?.Invoke($"[Commit.Clipboard] start, chars={text.Length}");
+        _log?.Invoke($"[Commit.Clipboard] start incremental commit, deltaChars={delta.Length}, isFinal={isFinal}");
 
-        SetClipboardText(text);
+        SetClipboardText(delta);
         _log?.Invoke("[Commit.Clipboard] clipboard updated");
 
         SendCtrlV();
         _log?.Invoke("[Commit.Clipboard] Ctrl+V sent");
 
         return Task.CompletedTask;
+    }
+
+    public void ResetIncrementalState()
+    {
+        lock (_sync)
+        {
+            _lastCommittedText = string.Empty;
+        }
+    }
+
+    private string ResolveDeltaAndAdvance(string confirmedText, bool isFinal)
+    {
+        var current = confirmedText ?? string.Empty;
+        lock (_sync)
+        {
+            if (!current.StartsWith(_lastCommittedText, StringComparison.Ordinal))
+            {
+                _lastCommittedText = string.Empty;
+            }
+
+            var delta = current.Length > _lastCommittedText.Length
+                ? current[_lastCommittedText.Length..]
+                : string.Empty;
+
+            _lastCommittedText = isFinal ? string.Empty : current;
+            return delta;
+        }
     }
 
     private static void SetClipboardText(string text)

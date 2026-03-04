@@ -8,5 +8,13 @@ public sealed class NoopTextCommitter : ITextCommitter
     {
         return Task.CompletedTask;
     }
-}
 
+    public Task CommitIncrementalAsync(string confirmedText, bool isFinal, CancellationToken cancellationToken)
+    {
+        return Task.CompletedTask;
+    }
+
+    public void ResetIncrementalState()
+    {
+    }
+}

@@ -19,10 +19,15 @@ public sealed class SessionStateMachine
         CurrentState = (CurrentState, trigger) switch
         {
             (SessionState.Idle, SessionTrigger.Press) => SessionState.Recording,
+            (SessionState.Idle, SessionTrigger.StartStreaming) => SessionState.Streaming,
             (SessionState.Idle, SessionTrigger.Reset) => SessionState.Idle,
 
             (SessionState.Recording, SessionTrigger.Release) => SessionState.Recognizing,
             (SessionState.Recording, SessionTrigger.Error) => SessionState.Failed,
+
+            (SessionState.Streaming, SessionTrigger.StreamingChunk) => SessionState.Streaming,
+            (SessionState.Streaming, SessionTrigger.StopStreaming) => SessionState.Recognizing,
+            (SessionState.Streaming, SessionTrigger.Error) => SessionState.Failed,
 
             (SessionState.Recognizing, SessionTrigger.AsrComplete) => SessionState.Committing,
             (SessionState.Recognizing, SessionTrigger.Error) => SessionState.Failed,

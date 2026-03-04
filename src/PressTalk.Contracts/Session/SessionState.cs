@@ -4,9 +4,9 @@ public enum SessionState
 {
     Idle = 0,
     Recording = 1,
-    Recognizing = 2,
-    Committing = 3,
-    Completed = 4,
-    Failed = 5
+    Streaming = 2,
+    Recognizing = 3,
+    Committing = 4,
+    Completed = 5,
+    Failed = 6
 }
-

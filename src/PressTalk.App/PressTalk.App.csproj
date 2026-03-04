@@ -9,6 +9,7 @@
     <ProjectReference Include="..\PressTalk.Audio\PressTalk.Audio.csproj" />
     <ProjectReference Include="..\PressTalk.Commit\PressTalk.Commit.csproj" />
     <ProjectReference Include="..\PressTalk.Contracts\PressTalk.Contracts.csproj" />
+    <ProjectReference Include="..\PressTalk.Data\PressTalk.Data.csproj" />
     <ProjectReference Include="..\PressTalk.Engine\PressTalk.Engine.csproj" />
     <ProjectReference Include="..\PressTalk.Normalize\PressTalk.Normalize.csproj" />
   </ItemGroup>
@@ -17,6 +18,10 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="..\PressTalk.Asr\qwen_runtime.py" Link="qwen_runtime.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="..\PressTalk.Asr\funasr_runtime.py" Link="funasr_runtime.py">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </None>
