@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -27,7 +28,9 @@ class RuntimeConfig:
     device: str
     int8: bool
     speaker_model: str
-    stride_samples: int = 9600
+    realtime_punc_model: str
+    final_punc_model: str
+    stride_samples: int = 12800
     encoder_chunk_look_back: int = 4
     decoder_chunk_look_back: int = 1
     chunk_size: List[int] = field(default_factory=lambda: [0, 10, 5])
@@ -42,18 +45,30 @@ class StreamingSession:
     cache: Dict[str, Any] = field(default_factory=dict)
     pending_audio: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     full_audio: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    confirmed_text: str = ""
+    raw_confirmed_text: str = ""
+    formatted_confirmed_text: str = ""
+    realtime_punc_cache: Dict[str, Any] = field(default_factory=dict)
     started_at: float = field(default_factory=time.perf_counter)
 
 
 class FunAsrRuntime:
+    _FILLER_PATTERNS = [
+        re.compile(r"\b(?:um+|uh+|erm+|emm+|ah+)\b", re.IGNORECASE),
+        re.compile(r"(那个|然后那个|就是|就是说|呃|嗯|额|啊|欸)+"),
+    ]
+    _SENTENCE_ENDINGS = "。！？!?"
+
     def __init__(self, config: RuntimeConfig) -> None:
         self.config = config
         self._auto_model_cls = None
         self._streaming_model = None
+        self._realtime_punc_model = None
+        self._final_punc_model = None
         self._speaker_runtime = None
         self._sessions: Dict[str, StreamingSession] = {}
         self._int8_applied = False
+        self._realtime_punc_unavailable = False
+        self._final_punc_unavailable = False
 
     def _ensure_framework(self):
         if self._auto_model_cls is not None:
@@ -70,6 +85,7 @@ class FunAsrRuntime:
                 model=self.config.streaming_model,
                 disable_update=True,
                 device=self.config.device,
+                disable_pbar=True,
             )
             self._apply_int8_quantization()
             elapsed = (time.perf_counter() - started) * 1000.0
@@ -91,6 +107,7 @@ class FunAsrRuntime:
                 spk_model=self.config.speaker_model,
                 disable_update=True,
                 device=self.config.device,
+                disable_pbar=True,
             )
             elapsed = (time.perf_counter() - started) * 1000.0
             print(
@@ -99,6 +116,72 @@ class FunAsrRuntime:
                 flush=True,
             )
         return self._speaker_runtime
+
+    def _load_realtime_punc_model(self):
+        if self._realtime_punc_model is not None:
+            return self._realtime_punc_model
+        if self._realtime_punc_unavailable:
+            return None
+        if not self.config.realtime_punc_model:
+            self._realtime_punc_unavailable = True
+            return None
+
+        self._ensure_framework()
+        started = time.perf_counter()
+        try:
+            self._realtime_punc_model = self._auto_model_cls(
+                model=self.config.realtime_punc_model,
+                disable_update=True,
+                device=self.config.device,
+                disable_pbar=True,
+            )
+            elapsed = (time.perf_counter() - started) * 1000.0
+            print(
+                f"[FunASR.Runtime.Py] realtime punc model loaded='{self.config.realtime_punc_model}' elapsed_ms={elapsed:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            self._realtime_punc_unavailable = True
+            print(
+                f"[FunASR.Runtime.Py] realtime punc model unavailable: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return self._realtime_punc_model
+
+    def _load_final_punc_model(self):
+        if self._final_punc_model is not None:
+            return self._final_punc_model
+        if self._final_punc_unavailable:
+            return None
+        if not self.config.final_punc_model:
+            self._final_punc_unavailable = True
+            return None
+
+        self._ensure_framework()
+        started = time.perf_counter()
+        try:
+            self._final_punc_model = self._auto_model_cls(
+                model=self.config.final_punc_model,
+                disable_update=True,
+                device=self.config.device,
+                disable_pbar=True,
+            )
+            elapsed = (time.perf_counter() - started) * 1000.0
+            print(
+                f"[FunASR.Runtime.Py] final punc model loaded='{self.config.final_punc_model}' elapsed_ms={elapsed:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            self._final_punc_unavailable = True
+            print(
+                f"[FunASR.Runtime.Py] final punc model unavailable: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return self._final_punc_model
 
     def _apply_int8_quantization(self) -> None:
         if self._int8_applied or not self.config.int8:
@@ -229,17 +312,124 @@ class FunAsrRuntime:
             return piece
         if current.endswith(piece):
             return current
+
+        max_overlap = min(len(current), len(piece))
+        for overlap in range(max_overlap, 0, -1):
+            if current.endswith(piece[:overlap]):
+                return current + piece[overlap:]
         return current + piece
+
+    @classmethod
+    def _strip_fillers(cls, text: str) -> str:
+        cleaned = text
+        for pattern in cls._FILLER_PATTERNS:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s*([，。！？,.!?；;：:])\s*", r"\1", cleaned)
+        cleaned = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", cleaned)
+        return cleaned.strip()
+
+    def _append_formatted(self, session: StreamingSession, raw_piece: str) -> tuple[str, str]:
+        current = session.formatted_confirmed_text
+        cleaned = self._strip_fillers(raw_piece)
+        if not cleaned:
+            text = current
+        else:
+            live_piece = self._apply_realtime_punctuation(session, cleaned)
+            text = self._append_confirmed(current, live_piece)
+
+        delta = text[len(current):] if text.startswith(current) else cleaned
+        return text, delta
+
+    @classmethod
+    def _segment_paragraphs(cls, text: str) -> str:
+        parts = [part.strip() for part in re.split(r"(?<=[。！？!?])", text) if part.strip()]
+        if len(parts) <= 1:
+            return text
+
+        grouped: List[str] = []
+        bucket: List[str] = []
+        for part in parts:
+            bucket.append(part)
+            joined = "".join(bucket)
+            if len(joined) >= 36 or len(bucket) >= 2:
+                grouped.append(joined)
+                bucket = []
+        if bucket:
+            grouped.append("".join(bucket))
+
+        return "\n".join(grouped)
+
+    @classmethod
+    def _normalize_punctuation(cls, text: str) -> str:
+        output = text.strip()
+        output = re.sub(r"\s+", " ", output)
+        output = re.sub(r"\s*([，。！？,.!?；;：:])\s*", r"\1", output)
+        output = re.sub(r"[，,]{2,}", "，", output)
+        output = re.sub(r"[。\.]{2,}", "。", output)
+        output = re.sub(r"([。！？!?])[，,]+", r"\1", output)
+        output = re.sub(r"^[，,]+", "", output)
+        return output
+
+    def _apply_realtime_punctuation(self, session: StreamingSession, text: str) -> str:
+        if not text:
+            return text
+        model = self._load_realtime_punc_model()
+        if model is None:
+            return text
+
+        try:
+            result = model.generate(input=text, cache=session.realtime_punc_cache)
+            punctuated = self._extract_text(result)
+            if punctuated:
+                return self._normalize_punctuation(punctuated)
+        except Exception as exc:
+            print(
+                f"[FunASR.Runtime.Py] realtime punctuation failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        return text
+
+    def _build_final_preview(self, text: str) -> str:
+        cleaned = self._strip_fillers(text)
+        if not cleaned:
+            return ""
+
+        output = cleaned
+        model = self._load_final_punc_model()
+        if model is not None:
+            try:
+                result = model.generate(input=cleaned)
+                punctuated = self._extract_text(result)
+                if punctuated:
+                    output = punctuated
+            except Exception as exc:
+                print(
+                    f"[FunASR.Runtime.Py] final punctuation failed: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        output = self._normalize_punctuation(output)
+        if output and output[-1] not in self._SENTENCE_ENDINGS:
+            output += "。"
+        return self._segment_paragraphs(output)
 
     def preload(self, include_speaker_diarization: bool) -> Dict[str, Any]:
         started = time.perf_counter()
         self._load_streaming_model()
+        realtime_punc = self._load_realtime_punc_model()
+        final_punc = self._load_final_punc_model()
         if include_speaker_diarization:
             self._load_speaker_runtime()
 
         return {
             "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
             "speaker_loaded": bool(include_speaker_diarization),
+            "realtime_punc_loaded": realtime_punc is not None,
+            "final_punc_loaded": final_punc is not None,
         }
 
     def start_streaming_session(
@@ -304,8 +494,8 @@ class FunAsrRuntime:
         if samples.size == 0:
             return {
                 "session_id": session_id,
-                "preview_text": session.confirmed_text,
-                "confirmed_text": session.confirmed_text,
+                "preview_text": session.formatted_confirmed_text,
+                "confirmed_text": session.formatted_confirmed_text,
                 "delta_text": "",
                 "is_final": False,
                 "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
@@ -321,13 +511,14 @@ class FunAsrRuntime:
             session.pending_audio = session.pending_audio[self.config.stride_samples :]
             piece = self._generate_for_chunk(session, chunk, is_final=False)
             if piece:
-                session.confirmed_text = self._append_confirmed(session.confirmed_text, piece)
-                delta_text += piece
+                session.raw_confirmed_text = self._append_confirmed(session.raw_confirmed_text, piece)
+                session.formatted_confirmed_text, formatted_delta = self._append_formatted(session, piece)
+                delta_text += formatted_delta
 
         return {
             "session_id": session_id,
-            "preview_text": session.confirmed_text,
-            "confirmed_text": session.confirmed_text,
+            "preview_text": session.formatted_confirmed_text,
+            "confirmed_text": session.formatted_confirmed_text,
             "delta_text": delta_text,
             "is_final": False,
             "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
@@ -358,11 +549,11 @@ class FunAsrRuntime:
                 flush=True,
             )
 
-        if session.confirmed_text.strip():
+        if session.formatted_confirmed_text.strip():
             return [
                 {
                     "speaker_id": "speaker-1",
-                    "text": session.confirmed_text.strip(),
+                    "text": session.formatted_confirmed_text.strip(),
                     "start_ms": 0,
                     "end_ms": int((time.perf_counter() - session.started_at) * 1000.0),
                 }
@@ -380,16 +571,23 @@ class FunAsrRuntime:
             piece = self._generate_for_chunk(session, session.pending_audio, is_final=True)
             session.pending_audio = np.empty(0, dtype=np.float32)
             if piece:
-                session.confirmed_text = self._append_confirmed(session.confirmed_text, piece)
-                final_delta = piece
+                session.raw_confirmed_text = self._append_confirmed(session.raw_confirmed_text, piece)
+                previous_text = session.formatted_confirmed_text
+                session.formatted_confirmed_text, _ = self._append_formatted(session, piece)
+                final_delta = (
+                    session.formatted_confirmed_text[len(previous_text):]
+                    if session.formatted_confirmed_text.startswith(previous_text)
+                    else ""
+                )
 
         speaker_segments = self._run_speaker_diarization(session)
-        confirmed_text = session.confirmed_text
+        confirmed_text = session.formatted_confirmed_text
+        preview_text = self._build_final_preview(session.raw_confirmed_text or confirmed_text)
         del self._sessions[session_id]
 
         return {
             "session_id": session_id,
-            "preview_text": confirmed_text,
+            "preview_text": preview_text or confirmed_text,
             "confirmed_text": confirmed_text,
             "delta_text": final_delta,
             "is_final": True,
@@ -403,7 +601,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--streaming-model", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--speaker-model", required=True)
+    parser.add_argument("--realtime-punc-model", default="iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727")
+    parser.add_argument("--final-punc-model", default="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch")
     parser.add_argument("--int8", default="0")
+    parser.add_argument("--stride-samples", type=int, default=12800)
     return parser
 
 
@@ -426,6 +627,9 @@ def main() -> int:
             device=args.device,
             int8=args.int8 == "1",
             speaker_model=args.speaker_model,
+            realtime_punc_model=str(args.realtime_punc_model or "").strip(),
+            final_punc_model=str(args.final_punc_model or "").strip(),
+            stride_samples=max(1600, int(args.stride_samples)),
         )
     )
 

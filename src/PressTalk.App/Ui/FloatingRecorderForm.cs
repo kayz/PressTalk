@@ -86,7 +86,7 @@ public sealed class FloatingRecorderForm : Form
                 MessageBoxIcon.Question);
             if (result == DialogResult.Yes)
             {
-                Close();
+                ExitRequested?.Invoke(this, EventArgs.Empty);
             }
         };
         _contextMenu.Items.Add(exitItem);
@@ -109,6 +109,7 @@ public sealed class FloatingRecorderForm : Form
 
     public event EventHandler? ToggleRequested;
     public event EventHandler? SettingsRequested;
+    public event EventHandler? ExitRequested;
 
     public void SetTopMost(bool topMost)
     {
@@ -192,7 +193,7 @@ public sealed class FloatingRecorderForm : Form
             return;
         }
 
-        var preferred = string.IsNullOrWhiteSpace(confirmedText) ? previewText : confirmedText;
+        var preferred = string.IsNullOrWhiteSpace(previewText) ? confirmedText : previewText;
         if (speakerSegments is not null && speakerSegments.Count > 0)
         {
             RenderSpeakerSegments(speakerSegments);

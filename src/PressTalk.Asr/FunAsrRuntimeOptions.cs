@@ -14,5 +14,13 @@ public sealed class FunAsrRuntimeOptions
 
     public string SpeakerModel { get; init; } = "iic/speech_campplus_sv_zh-cn_16k-common";
 
+    public string RealtimePunctuationModel { get; init; } =
+        "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727";
+
+    public string FinalPunctuationModel { get; init; } =
+        "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch";
+
+    public int StrideSamples { get; init; } = 12800;
+
     public int CommandTimeoutMs { get; init; } = 180000;
 }

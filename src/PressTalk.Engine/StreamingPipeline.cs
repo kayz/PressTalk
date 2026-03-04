@@ -6,9 +6,17 @@ namespace PressTalk.Engine;
 
 public sealed class StreamingPipeline : IStreamingPipeline
 {
+    private sealed class SessionCommitState
+    {
+        public int LastCommittedLength { get; set; }
+    }
+
     private readonly IStreamingAsrBackend _asrBackend;
     private readonly ITextCommitter _textCommitter;
     private readonly Action<string>? _log;
+    private readonly Dictionary<string, SessionCommitState> _sessions = new();
+    private readonly object _sync = new();
+    private readonly int _liveCommitMinChars;
 
     public StreamingPipeline(
         IStreamingAsrBackend asrBackend,
@@ -18,6 +26,7 @@ public sealed class StreamingPipeline : IStreamingPipeline
         _asrBackend = asrBackend;
         _textCommitter = textCommitter;
         _log = log;
+        _liveCommitMinChars = ResolveLiveCommitMinChars();
     }
 
     public async Task StartSessionAsync(
@@ -28,6 +37,11 @@ public sealed class StreamingPipeline : IStreamingPipeline
         CancellationToken cancellationToken)
     {
         _textCommitter.ResetIncrementalState();
+        lock (_sync)
+        {
+            _sessions[sessionId] = new SessionCommitState();
+        }
+
         _log?.Invoke(
             $"[Engine.StreamingPipeline] start session={sessionId}, lang={languageHint}, hotwords={hotwords.Count}, speaker={enableSpeakerDiarization}");
 
@@ -51,10 +65,10 @@ public sealed class StreamingPipeline : IStreamingPipeline
             sampleRate,
             cancellationToken);
 
-        if (!string.IsNullOrWhiteSpace(result.ConfirmedText))
+        if (ShouldCommitIncremental(sessionId, result, out var textToCommit))
         {
             await _textCommitter.CommitIncrementalAsync(
-                result.ConfirmedText,
+                textToCommit,
                 isFinal: result.IsFinal,
                 cancellationToken);
         }
@@ -73,8 +87,71 @@ public sealed class StreamingPipeline : IStreamingPipeline
             isFinal: true,
             cancellationToken);
 
+        lock (_sync)
+        {
+            _sessions.Remove(sessionId);
+        }
+
         _log?.Invoke(
             $"[Engine.StreamingPipeline] end session={sessionId}, chars={result.ConfirmedText.Length}, speakers={result.SpeakerSegments.Count}");
         return result;
+    }
+
+    private bool ShouldCommitIncremental(
+        string sessionId,
+        StreamingAsrResult result,
+        out string textToCommit)
+    {
+        textToCommit = result.ConfirmedText ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(textToCommit))
+        {
+            return false;
+        }
+
+        SessionCommitState state;
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(sessionId, out state!))
+            {
+                state = new SessionCommitState();
+                _sessions[sessionId] = state;
+            }
+        }
+
+        var committedLen = state.LastCommittedLength;
+        if (committedLen > textToCommit.Length)
+        {
+            committedLen = 0;
+        }
+
+        var newChars = textToCommit.Length - committedLen;
+        if (newChars <= 0)
+        {
+            return false;
+        }
+
+        if (!result.IsFinal && committedLen > 0)
+        {
+            var tail = textToCommit[committedLen..];
+            var hasBoundary = tail.IndexOfAny(['，', '。', '！', '？', ',', '.', '!', '?', '\n']) >= 0;
+            if (newChars < _liveCommitMinChars && !hasBoundary)
+            {
+                return false;
+            }
+        }
+
+        state.LastCommittedLength = textToCommit.Length;
+        return true;
+    }
+
+    private static int ResolveLiveCommitMinChars()
+    {
+        var raw = Environment.GetEnvironmentVariable("PRESSTALK_LIVE_COMMIT_MIN_CHARS");
+        if (int.TryParse(raw, out var parsed))
+        {
+            return Math.Clamp(parsed, 2, 40);
+        }
+
+        return 8;
     }
 }

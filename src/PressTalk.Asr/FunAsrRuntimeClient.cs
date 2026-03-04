@@ -158,9 +158,21 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             {
                 try
                 {
-                    await SendCommandAsync(
+                    var shutdownTask = SendCommandAsync(
                         new Dictionary<string, object?> { ["action"] = "shutdown" },
                         CancellationToken.None);
+                    var completed = await Task.WhenAny(
+                        shutdownTask,
+                        Task.Delay(1200));
+
+                    if (completed == shutdownTask)
+                    {
+                        await shutdownTask;
+                    }
+                    else
+                    {
+                        _log?.Invoke("[FunASR.Runtime] shutdown command timed out, forcing process exit");
+                    }
                 }
                 catch
                 {
@@ -256,7 +268,7 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             }
 
             _log?.Invoke(
-                $"[FunASR.Runtime] starting process, python='{_options.PythonExecutable}', script='{_options.ScriptPath}', model='{_options.StreamingModel}', device='{_options.Device}', int8={_options.EnableInt8Quantization}, speakerModel='{_options.SpeakerModel}'");
+                $"[FunASR.Runtime] starting process, python='{_options.PythonExecutable}', script='{_options.ScriptPath}', model='{_options.StreamingModel}', device='{_options.Device}', int8={_options.EnableInt8Quantization}, speakerModel='{_options.SpeakerModel}', realtimePunc='{_options.RealtimePunctuationModel}', finalPunc='{_options.FinalPunctuationModel}'");
 
             var startInfo = new ProcessStartInfo
             {
@@ -280,8 +292,14 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             startInfo.ArgumentList.Add(_options.Device);
             startInfo.ArgumentList.Add("--speaker-model");
             startInfo.ArgumentList.Add(_options.SpeakerModel);
+            startInfo.ArgumentList.Add("--realtime-punc-model");
+            startInfo.ArgumentList.Add(_options.RealtimePunctuationModel);
+            startInfo.ArgumentList.Add("--final-punc-model");
+            startInfo.ArgumentList.Add(_options.FinalPunctuationModel);
             startInfo.ArgumentList.Add("--int8");
             startInfo.ArgumentList.Add(_options.EnableInt8Quantization ? "1" : "0");
+            startInfo.ArgumentList.Add("--stride-samples");
+            startInfo.ArgumentList.Add(Math.Max(1600, _options.StrideSamples).ToString());
 
             var process = new Process
             {
@@ -340,16 +358,18 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             var startedAt = Stopwatch.GetTimestamp();
             var line = JsonSerializer.Serialize(command, JsonOptions);
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(_options.CommandTimeoutMs));
-
             _log?.Invoke($"[FunASR.Runtime] command send, action={action}, request={requestId}");
-            await _stdin.WriteLineAsync(line).WaitAsync(timeoutCts.Token);
-            await _stdin.FlushAsync().WaitAsync(timeoutCts.Token);
+            await _stdin.WriteLineAsync(line);
+            await _stdin.FlushAsync();
 
             while (true)
             {
-                var responseLine = await _stdout.ReadLineAsync().WaitAsync(timeoutCts.Token);
+                cancellationToken.ThrowIfCancellationRequested();
+                var responseLine = await _stdout.ReadLineAsync();
+                if (responseLine is null)
+                {
+                    throw new InvalidOperationException("FunASR runtime stdout closed unexpectedly.");
+                }
                 if (string.IsNullOrWhiteSpace(responseLine))
                 {
                     continue;

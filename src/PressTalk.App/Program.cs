@@ -19,9 +19,24 @@ namespace PressTalk.App;
 
 internal static class Program
 {
+    private const int SwHide = 0;
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
     [STAThread]
     private static int Main(string[] args)
     {
+        // Hide console host window when launched via `dotnet run`.
+        var console = GetConsoleWindow();
+        if (console != IntPtr.Zero)
+        {
+            _ = ShowWindow(console, SwHide);
+        }
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
@@ -133,6 +148,8 @@ internal sealed class PressTalkUiHost : IDisposable
     private bool _initialized;
     private bool _initializationStarted;
     private bool _hotkeyConflictActive;
+    private bool _shutdownInProgress;
+    private bool _shutdownCompleted;
 
     private string _lastPreviewText = string.Empty;
     private string _lastConfirmedText = string.Empty;
@@ -145,10 +162,17 @@ internal sealed class PressTalkUiHost : IDisposable
         Form.SetHintText("启动中...");
         Form.ToggleRequested += (_, _) => OnToggleRequested();
         Form.SettingsRequested += (_, _) => OpenSettingsDialog();
-        Form.FormClosing += (_, _) =>
+        Form.ExitRequested += (_, _) => BeginShutdownAndExit(forceExit: true);
+        Form.FormClosing += (_, e) =>
         {
-            SaveWindowPosition();
-            ShutdownAsync().GetAwaiter().GetResult();
+            if (_shutdownCompleted)
+            {
+                SaveWindowPosition();
+                return;
+            }
+
+            e.Cancel = true;
+            BeginShutdownAndExit(forceExit: false);
         };
     }
 
@@ -254,17 +278,46 @@ internal sealed class PressTalkUiHost : IDisposable
             return;
         }
 
-        _shutdownCts.Cancel();
-        _signalChannel.Writer.TryComplete();
-
         _hotkeyHook?.Dispose();
         _hotkeyHook = null;
+
+        if (_isRecording && _controller is not null)
+        {
+            try
+            {
+                _log?.Invoke("[App] shutdown stopping active recording");
+                using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+                var finalResult = await _controller.StopStreamingSessionAsync(stopTimeout.Token);
+                _isRecording = false;
+                _isHotkeyPressed = false;
+                UpdateButtonVisual();
+                Form.SetLivePreview(
+                    finalResult.PreviewText,
+                    finalResult.ConfirmedText,
+                    finalResult.SpeakerSegments);
+                await SaveHistoryAsync(finalResult, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log?.Invoke($"[App] shutdown stop recording failed: {ex.Message}");
+                _isRecording = false;
+                _isHotkeyPressed = false;
+                UpdateButtonVisual();
+            }
+        }
+
+        _shutdownCts.Cancel();
+        _signalChannel.Writer.TryComplete();
 
         if (_workerTask is not null)
         {
             try
             {
-                await _workerTask;
+                var completed = await Task.WhenAny(_workerTask, Task.Delay(1500));
+                if (completed != _workerTask)
+                {
+                    _log?.Invoke("[App] worker shutdown timed out");
+                }
             }
             catch
             {
@@ -276,7 +329,12 @@ internal sealed class PressTalkUiHost : IDisposable
         {
             try
             {
-                await _runtime.DisposeAsync();
+                var disposeTask = _runtime.DisposeAsync().AsTask();
+                var completed = await Task.WhenAny(disposeTask, Task.Delay(2500));
+                if (completed != disposeTask)
+                {
+                    _log?.Invoke("[App] runtime shutdown timed out");
+                }
             }
             catch
             {
@@ -285,6 +343,58 @@ internal sealed class PressTalkUiHost : IDisposable
 
             _runtime = null;
         }
+    }
+
+    private void BeginShutdownAndExit(bool forceExit)
+    {
+        if (_shutdownCompleted || _shutdownInProgress)
+        {
+            return;
+        }
+
+        _shutdownInProgress = true;
+        SaveWindowPosition();
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ShutdownAsync();
+            }
+            finally
+            {
+                _shutdownCompleted = true;
+                if (forceExit)
+                {
+                    try
+                    {
+                        Environment.Exit(0);
+                    }
+                    catch
+                    {
+                        // Ignore force-exit errors.
+                    }
+                }
+                else if (!Form.IsDisposed)
+                {
+                    try
+                    {
+                        if (Form.InvokeRequired)
+                        {
+                            Form.BeginInvoke(new MethodInvoker(() => Form.Close()));
+                        }
+                        else
+                        {
+                            Form.Close();
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore close race.
+                    }
+                }
+            }
+        });
     }
 
     private async Task RunSessionWorkerAsync(CancellationToken cancellationToken)
@@ -408,7 +518,10 @@ internal sealed class PressTalkUiHost : IDisposable
             return;
         }
 
-        var text = result.ConfirmedText.Trim();
+        var preferredText = string.IsNullOrWhiteSpace(result.PreviewText)
+            ? result.ConfirmedText
+            : result.PreviewText;
+        var text = preferredText.Trim();
         if (text.Length == 0)
         {
             return;
@@ -629,8 +742,11 @@ internal sealed class PressTalkUiHost : IDisposable
         var pythonOverride = ResolveOption(args, "--funasr-python=");
         var modelOverride = ResolveOption(args, "--funasr-model=");
         var speakerModelOverride = ResolveOption(args, "--funasr-speaker-model=");
+        var realtimePuncModelOverride = ResolveOption(args, "--funasr-realtime-punc-model=");
+        var finalPuncModelOverride = ResolveOption(args, "--funasr-final-punc-model=");
         var deviceOverride = ResolveOption(args, "--funasr-device=");
         var int8Override = ResolveOption(args, "--funasr-int8=");
+        var strideOverride = ResolveOption(args, "--funasr-stride=");
 
         var pythonExecutable = pythonOverride
             ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_PYTHON")
@@ -645,6 +761,11 @@ internal sealed class PressTalkUiHost : IDisposable
             ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_INT8")
             ?? "0";
         var enableInt8 = int8ValueRaw is "1" or "true" or "True" or "TRUE";
+        var strideRaw = strideOverride
+            ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_STRIDE_SAMPLES");
+        var strideSamples = int.TryParse(strideRaw, out var strideParsed)
+            ? Math.Max(1600, strideParsed)
+            : 12800;
 
         return new FunAsrRuntimeOptions
         {
@@ -658,8 +779,15 @@ internal sealed class PressTalkUiHost : IDisposable
             SpeakerModel = speakerModelOverride
                 ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_SPK_MODEL")
                 ?? "iic/speech_campplus_sv_zh-cn_16k-common",
+            RealtimePunctuationModel = realtimePuncModelOverride
+                ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_REALTIME_PUNC_MODEL")
+                ?? "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+            FinalPunctuationModel = finalPuncModelOverride
+                ?? Environment.GetEnvironmentVariable("PRESSTALK_FUNASR_FINAL_PUNC_MODEL")
+                ?? "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
             Device = resolvedDevice,
             EnableInt8Quantization = enableInt8,
+            StrideSamples = strideSamples,
             CommandTimeoutMs = 180000
         };
     }
