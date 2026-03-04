@@ -347,25 +347,51 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             await _stdin.WriteLineAsync(line).WaitAsync(timeoutCts.Token);
             await _stdin.FlushAsync().WaitAsync(timeoutCts.Token);
 
-            var responseLine = await _stdout.ReadLineAsync().WaitAsync(timeoutCts.Token);
-            if (string.IsNullOrWhiteSpace(responseLine))
+            while (true)
             {
-                throw new InvalidOperationException("FunASR runtime returned an empty response.");
-            }
+                var responseLine = await _stdout.ReadLineAsync().WaitAsync(timeoutCts.Token);
+                if (string.IsNullOrWhiteSpace(responseLine))
+                {
+                    continue;
+                }
 
-            using var json = JsonDocument.Parse(responseLine);
-            var root = json.RootElement;
-            if (root.TryGetProperty("ok", out var okElement) && !okElement.GetBoolean())
-            {
-                var error = TryReadString(root, "error") ?? "unknown runtime error";
-                var elapsedMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
-                _log?.Invoke($"[FunASR.Runtime] command failed, action={action}, request={requestId}, elapsedMs={elapsedMs:F1}, error='{error}'");
-                throw new InvalidOperationException($"FunASR runtime error: {error}");
-            }
+                JsonDocument json;
+                try
+                {
+                    json = JsonDocument.Parse(responseLine);
+                }
+                catch (JsonException)
+                {
+                    _log?.Invoke($"[FunASR.Runtime] non-json stdout ignored: {responseLine}");
+                    continue;
+                }
 
-            var okElapsed = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
-            _log?.Invoke($"[FunASR.Runtime] command ok, action={action}, request={requestId}, elapsedMs={okElapsed:F1}");
-            return root.Clone();
+                using (json)
+                {
+                    var root = json.RootElement;
+                    var responseRequestId = TryReadString(root, "request_id");
+                    if (!string.IsNullOrWhiteSpace(responseRequestId)
+                        && !string.Equals(responseRequestId, requestId, StringComparison.Ordinal))
+                    {
+                        _log?.Invoke(
+                            $"[FunASR.Runtime] response request_id mismatch ignored, expected={requestId}, actual={responseRequestId}");
+                        continue;
+                    }
+
+                    if (root.TryGetProperty("ok", out var okElement) && !okElement.GetBoolean())
+                    {
+                        var error = TryReadString(root, "error") ?? "unknown runtime error";
+                        var elapsedMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
+                        _log?.Invoke(
+                            $"[FunASR.Runtime] command failed, action={action}, request={requestId}, elapsedMs={elapsedMs:F1}, error='{error}'");
+                        throw new InvalidOperationException($"FunASR runtime error: {error}");
+                    }
+
+                    var okElapsed = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
+                    _log?.Invoke($"[FunASR.Runtime] command ok, action={action}, request={requestId}, elapsedMs={okElapsed:F1}");
+                    return root.Clone();
+                }
+            }
         }
         finally
         {
