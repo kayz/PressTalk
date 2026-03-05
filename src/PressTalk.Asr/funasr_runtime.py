@@ -30,7 +30,10 @@ class RuntimeConfig:
     speaker_model: str
     realtime_punc_model: str
     final_punc_model: str
-    stride_samples: int = 12800
+    transcription_mode: str = "fast"
+    stride_samples: int = 9600
+    endpoint_silence_ms: int = 420
+    endpoint_rms_threshold: float = 0.0065
     encoder_chunk_look_back: int = 4
     decoder_chunk_look_back: int = 1
     chunk_size: List[int] = field(default_factory=lambda: [0, 10, 5])
@@ -48,6 +51,8 @@ class StreamingSession:
     raw_confirmed_text: str = ""
     formatted_confirmed_text: str = ""
     realtime_punc_cache: Dict[str, Any] = field(default_factory=dict)
+    silence_run_samples: int = 0
+    has_detected_speech: bool = False
     started_at: float = field(default_factory=time.perf_counter)
 
 
@@ -60,6 +65,7 @@ class FunAsrRuntime:
 
     def __init__(self, config: RuntimeConfig) -> None:
         self.config = config
+        self.config.transcription_mode = "formatted" if str(config.transcription_mode).strip().lower() == "formatted" else "fast"
         self._auto_model_cls = None
         self._streaming_model = None
         self._realtime_punc_model = None
@@ -69,6 +75,10 @@ class FunAsrRuntime:
         self._int8_applied = False
         self._realtime_punc_unavailable = False
         self._final_punc_unavailable = False
+
+    @property
+    def _formatting_enabled(self) -> bool:
+        return self.config.transcription_mode == "formatted"
 
     def _ensure_framework(self):
         if self._auto_model_cls is not None:
@@ -331,14 +341,18 @@ class FunAsrRuntime:
 
     def _append_formatted(self, session: StreamingSession, raw_piece: str) -> tuple[str, str]:
         current = session.formatted_confirmed_text
-        cleaned = self._strip_fillers(raw_piece)
-        if not cleaned:
-            text = current
+        if self._formatting_enabled:
+            cleaned = self._strip_fillers(raw_piece)
+            if not cleaned:
+                text = current
+            else:
+                live_piece = self._apply_realtime_punctuation(session, cleaned)
+                text = self._append_confirmed(current, live_piece)
         else:
-            live_piece = self._apply_realtime_punctuation(session, cleaned)
-            text = self._append_confirmed(current, live_piece)
+            plain = (raw_piece or "").strip()
+            text = self._append_confirmed(current, plain) if plain else current
 
-        delta = text[len(current):] if text.startswith(current) else cleaned
+        delta = text[len(current):] if text.startswith(current) else (raw_piece or "")
         return text, delta
 
     @classmethod
@@ -372,7 +386,7 @@ class FunAsrRuntime:
         return output
 
     def _apply_realtime_punctuation(self, session: StreamingSession, text: str) -> str:
-        if not text:
+        if not self._formatting_enabled or not text:
             return text
         model = self._load_realtime_punc_model()
         if model is None:
@@ -393,6 +407,9 @@ class FunAsrRuntime:
         return text
 
     def _build_final_preview(self, text: str) -> str:
+        if not self._formatting_enabled:
+            return (text or "").strip()
+
         cleaned = self._strip_fillers(text)
         if not cleaned:
             return ""
@@ -417,11 +434,47 @@ class FunAsrRuntime:
             output += "。"
         return self._segment_paragraphs(output)
 
+    @staticmethod
+    def _append_pause_comma(text: str) -> str:
+        if not text:
+            return text
+        if text[-1] in "，,。！？!?；;：:\n":
+            return text
+        return text + "，"
+
+    @staticmethod
+    def _rms(samples: np.ndarray) -> float:
+        if samples.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+
+    def _should_endpoint_flush(self, session: StreamingSession, samples: np.ndarray) -> bool:
+        if samples.size == 0:
+            return False
+
+        rms = self._rms(samples)
+        is_silence = rms <= self.config.endpoint_rms_threshold
+        if is_silence:
+            session.silence_run_samples += int(samples.size)
+        else:
+            session.silence_run_samples = 0
+            session.has_detected_speech = True
+
+        endpoint_samples = int(16000 * max(120, self.config.endpoint_silence_ms) / 1000.0)
+        if not session.has_detected_speech:
+            return False
+        if session.pending_audio.size == 0:
+            return False
+        if session.silence_run_samples < endpoint_samples:
+            return False
+
+        return True
+
     def preload(self, include_speaker_diarization: bool) -> Dict[str, Any]:
         started = time.perf_counter()
         self._load_streaming_model()
-        realtime_punc = self._load_realtime_punc_model()
-        final_punc = self._load_final_punc_model()
+        realtime_punc = self._load_realtime_punc_model() if self._formatting_enabled else None
+        final_punc = self._load_final_punc_model() if self._formatting_enabled else None
         if include_speaker_diarization:
             self._load_speaker_runtime()
 
@@ -430,6 +483,7 @@ class FunAsrRuntime:
             "speaker_loaded": bool(include_speaker_diarization),
             "realtime_punc_loaded": realtime_punc is not None,
             "final_punc_loaded": final_punc is not None,
+            "mode": self.config.transcription_mode,
         }
 
     def start_streaming_session(
@@ -514,6 +568,23 @@ class FunAsrRuntime:
                 session.raw_confirmed_text = self._append_confirmed(session.raw_confirmed_text, piece)
                 session.formatted_confirmed_text, formatted_delta = self._append_formatted(session, piece)
                 delta_text += formatted_delta
+
+        # On natural short pause, flush residual tail as sentence endpoint so the
+        # last token appears without waiting for next utterance.
+        if self._should_endpoint_flush(session, samples):
+            tail = session.pending_audio
+            session.pending_audio = np.empty(0, dtype=np.float32)
+            piece = self._generate_for_chunk(session, tail, is_final=True)
+            session.silence_run_samples = 0
+            if piece:
+                session.raw_confirmed_text = self._append_confirmed(session.raw_confirmed_text, piece)
+                session.formatted_confirmed_text, formatted_delta = self._append_formatted(session, piece)
+                delta_text += formatted_delta
+                if not self._formatting_enabled:
+                    with_comma = self._append_pause_comma(session.formatted_confirmed_text)
+                    if with_comma != session.formatted_confirmed_text:
+                        session.formatted_confirmed_text = with_comma
+                        delta_text += "，"
 
         return {
             "session_id": session_id,
@@ -603,8 +674,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speaker-model", required=True)
     parser.add_argument("--realtime-punc-model", default="iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727")
     parser.add_argument("--final-punc-model", default="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch")
+    parser.add_argument("--transcription-mode", default="fast", choices=["fast", "formatted"])
     parser.add_argument("--int8", default="0")
-    parser.add_argument("--stride-samples", type=int, default=12800)
+    parser.add_argument("--stride-samples", type=int, default=9600)
+    parser.add_argument("--endpoint-silence-ms", type=int, default=420)
+    parser.add_argument("--endpoint-rms-threshold", type=float, default=0.0065)
     return parser
 
 
@@ -629,7 +703,10 @@ def main() -> int:
             speaker_model=args.speaker_model,
             realtime_punc_model=str(args.realtime_punc_model or "").strip(),
             final_punc_model=str(args.final_punc_model or "").strip(),
+            transcription_mode=str(args.transcription_mode or "fast").strip().lower(),
             stride_samples=max(1600, int(args.stride_samples)),
+            endpoint_silence_ms=max(120, int(args.endpoint_silence_ms)),
+            endpoint_rms_threshold=max(0.001, float(args.endpoint_rms_threshold)),
         )
     )
 

@@ -20,7 +20,13 @@ public sealed class FunAsrRuntimeOptions
     public string FinalPunctuationModel { get; init; } =
         "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch";
 
-    public int StrideSamples { get; init; } = 12800;
+    public string TranscriptionMode { get; init; } = "fast";
+
+    public int StrideSamples { get; init; } = 9600;
+
+    public int EndpointSilenceMs { get; init; } = 420;
+
+    public double EndpointRmsThreshold { get; init; } = 0.0065;
 
     public int CommandTimeoutMs { get; init; } = 180000;
 }

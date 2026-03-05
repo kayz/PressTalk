@@ -268,7 +268,7 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             }
 
             _log?.Invoke(
-                $"[FunASR.Runtime] starting process, python='{_options.PythonExecutable}', script='{_options.ScriptPath}', model='{_options.StreamingModel}', device='{_options.Device}', int8={_options.EnableInt8Quantization}, speakerModel='{_options.SpeakerModel}', realtimePunc='{_options.RealtimePunctuationModel}', finalPunc='{_options.FinalPunctuationModel}'");
+                $"[FunASR.Runtime] starting process, python='{_options.PythonExecutable}', script='{_options.ScriptPath}', model='{_options.StreamingModel}', device='{_options.Device}', mode='{_options.TranscriptionMode}', int8={_options.EnableInt8Quantization}, speakerModel='{_options.SpeakerModel}', realtimePunc='{_options.RealtimePunctuationModel}', finalPunc='{_options.FinalPunctuationModel}', endpointSilenceMs={_options.EndpointSilenceMs}, endpointRms={_options.EndpointRmsThreshold:F4}");
 
             var startInfo = new ProcessStartInfo
             {
@@ -296,10 +296,16 @@ public sealed class FunAsrRuntimeClient : IAsyncDisposable
             startInfo.ArgumentList.Add(_options.RealtimePunctuationModel);
             startInfo.ArgumentList.Add("--final-punc-model");
             startInfo.ArgumentList.Add(_options.FinalPunctuationModel);
+            startInfo.ArgumentList.Add("--transcription-mode");
+            startInfo.ArgumentList.Add(_options.TranscriptionMode);
             startInfo.ArgumentList.Add("--int8");
             startInfo.ArgumentList.Add(_options.EnableInt8Quantization ? "1" : "0");
             startInfo.ArgumentList.Add("--stride-samples");
             startInfo.ArgumentList.Add(Math.Max(1600, _options.StrideSamples).ToString());
+            startInfo.ArgumentList.Add("--endpoint-silence-ms");
+            startInfo.ArgumentList.Add(Math.Max(120, _options.EndpointSilenceMs).ToString());
+            startInfo.ArgumentList.Add("--endpoint-rms-threshold");
+            startInfo.ArgumentList.Add(Math.Clamp(_options.EndpointRmsThreshold, 0.001, 0.2).ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture));
 
             var process = new Process
             {

@@ -241,6 +241,6 @@ public sealed class StreamingController
             return TimeSpan.FromMilliseconds(Math.Clamp(ms, 200, 1200));
         }
 
-        return TimeSpan.FromMilliseconds(450);
+        return TimeSpan.FromMilliseconds(320);
     }
 }
